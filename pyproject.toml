@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oby"
+version = "0.1.0"
+description = "Record an invisible-playwright session through mitmcloak, with an optional upstream proxy and Cursory mouse."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "mavroth" }]
+dependencies = [
+  "invisible-playwright>=0.51",
+  "invisible-playwright-mcp>=0.73",
+  "mitmcloak>=0.1",
+  "cursory>=2.1",
+  "certifi",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+GitHub = "https://github.com/mavroth/oby"
+
+[project.scripts]
+oby = "oby.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["oby*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
