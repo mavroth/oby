@@ -18,18 +18,24 @@ def _build() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="oby",
-        description="Record an invisible-playwright session through mitmcloak.",
+        description="Record a stealth Firefox session as a HAR, including the JavaScript that ran.",
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    browse = sub.add_parser("browse", parents=[common], help="Open a window you drive yourself")
+    browse = sub.add_parser(
+        "browse",
+        parents=[common],
+        help="Open a window you drive yourself",
+        description="Open Firefox and record the visit. session.har and scripts.json are written when the window closes.",
+    )
     browse.add_argument("--url", default=None)
     browse.add_argument("--headless", action="store_true")
 
     agent = sub.add_parser(
         "mcp",
         parents=[common],
-        help="Let an agent drive the browser through invisible-playwright-mcp",
+        help="Let an agent drive the browser",
+        description="Start the same recorder and let an agent drive Firefox. session.har and scripts.json are written when the client closes.",
     )
     agent.add_argument("--headless", action="store_true", help="Hide the window. Default is visible.")
     return parser
@@ -37,6 +43,9 @@ def _build() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+    # `oby --help` is the program. A flag after that still means browse.
+    if raw in (["-h"], ["--help"]):
+        _build().parse_args(raw)
     if not raw or raw[0].startswith("-"):
         raw = ["browse", *raw]
     args = _build().parse_args(raw)

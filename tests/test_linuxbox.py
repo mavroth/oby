@@ -131,10 +131,14 @@ def test_missing_docker_is_a_clean_error(monkeypatch: pytest.MonkeyPatch, capsys
     assert "Docker" in capsys.readouterr().err
 
 
-def test_help_does_not_start_docker():
+def test_help_does_not_start_docker(capsys: pytest.CaptureFixture[str]):
     with pytest.raises(SystemExit) as exc:
         main(["--help"])
     assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "JavaScript that ran" in out
+    assert "browse" in out
+    assert "mcp" in out
 
 
 def test_darwin_hands_the_command_over(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

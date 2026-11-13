@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "oby"
 version = "0.1.0"
-description = "Record an invisible-playwright session through mitmcloak, with an optional upstream proxy and Cursory mouse."
+description = "Record a stealth Firefox session as a HAR, including the JavaScript that ran."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

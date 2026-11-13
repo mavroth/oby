@@ -1,4 +1,4 @@
-"""Record an invisible-playwright session through mitmcloak."""
+"""Record a stealth Firefox session as a HAR, including the JavaScript that ran."""
 
 from oby.session import Session
 
