@@ -91,7 +91,7 @@ def _browse(proxy: str | None, out: Path, url: str | None, headless: bool) -> in
             print(exc, file=sys.stderr)
             return 1
         raise
-    print(f"Saved {label}/flows.jsonl, storage.json, and profile/", flush=True)
+    print(f"Saved {label}/session.har and {label}/scripts.json", flush=True)
     return 0
 
 

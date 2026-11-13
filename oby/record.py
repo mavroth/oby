@@ -11,6 +11,8 @@ import base64
 import json
 import os
 
+from oby.scripts import allow_script_report, is_sink_flow
+
 _seen: set[int] = set()
 _fp = None
 # client connection id -> HTTP/2 preface. mitmproxy strips pseudo-headers
@@ -96,6 +98,16 @@ def exchange(flow) -> dict:
     error = getattr(flow, "error", None)
     if error:
         record["error"] = str(error)
+    started = getattr(request, "timestamp_start", None)
+    ended = None
+    if response is not None:
+        ended = getattr(response, "timestamp_end", None)
+    if ended is None:
+        ended = getattr(request, "timestamp_end", None)
+    if isinstance(started, (int, float)):
+        record["started"] = started
+    if isinstance(ended, (int, float)):
+        record["ended"] = ended
     meta = getattr(flow, "metadata", None) or {}
     cloak = meta.get("mitmcloak")
     if cloak is not None:
@@ -117,6 +129,9 @@ def _open():
 
 
 def _write(flow) -> None:
+    # The script hook posts here. It is not a page request.
+    if is_sink_flow(flow):
+        return
     if getattr(flow, "response", None) is None and not getattr(flow, "error", None):
         return
     key = id(flow)
@@ -209,10 +224,16 @@ class Record:
 
     def request(self, flow) -> None:
         # mitmcloak fills flow.response inside the request hook.
+        # Snapshot first. The response hook then widens connect-src for the
+        # script report, on the copy the browser receives.
         _write(flow)
 
     def response(self, flow) -> None:
         _write(flow)
+        try:
+            allow_script_report(flow)
+        except Exception:
+            pass
 
     def error(self, flow) -> None:
         _write(flow)

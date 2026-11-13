@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from oby import record
+from oby import collect, record
+from oby.scripts import LIVE_NAME, SAVE_FILTER
 
 
 def redact_proxy(url: str | None) -> str | None:
@@ -63,6 +64,10 @@ def build_mitmdump_command(
         "-q",
         "--set", f"confdir={confdir}",
         "--set", "connection_strategy=lazy",
+        # The collector answers before mitmcloak. record.py stays last among
+        # the scripts so its running() hook can place HTTP/2 capture after
+        # mitmproxy's own next_layer addon.
+        "-s", str(Path(collect.__file__).resolve()),
         "-s", cloak_addon_path(),
         "-s", str(Path(record.__file__).resolve()),
         "-w", str(flow_path),
@@ -73,6 +78,7 @@ def build_mitmdump_command(
     ]
     if upstream:
         command.extend(["--set", f"mitmcloak_proxy={upstream}"])
+    command.append(SAVE_FILTER)
     return command
 
 
@@ -98,6 +104,7 @@ class Mitm:
         self.confdir = out / "mitm"
         self.flows = out / "flows.mitm"
         self.record_path = out / "flows.jsonl"
+        self.scripts_path = out / LIVE_NAME
         self.log_path = out / "mitmdump.log"
 
     @property
@@ -128,6 +135,7 @@ class Mitm:
         log = self.log_path.open("w", encoding="utf-8")
         env = os.environ.copy()
         env["OBY_RECORD"] = str(self.record_path)
+        env["OBY_SCRIPTS"] = str(self.scripts_path)
         env["OBY_MAX_BODY"] = str(self.max_body)
         self.process = subprocess.Popen(
             command,

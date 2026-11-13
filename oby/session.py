@@ -136,8 +136,8 @@ class Session:
             (signal.SIGINT, signal.signal(signal.SIGINT, signal.SIG_IGN)),
             (signal.SIGTERM, signal.signal(signal.SIGTERM, signal.SIG_IGN)),
         )
+        final_url = None
         try:
-            final_url = None
             if self.page is not None:
                 try:
                     final_url = self.page.url
@@ -155,6 +155,13 @@ class Session:
                     pass
         finally:
             self.mitm.stop()
+            self._write_har()
+            self._write_scripts()
+            if self.started_at is not None:
+                try:
+                    self._write_meta(final_url)
+                except Exception:
+                    pass
             restore_trust(self._saved_trust)
             self._saved_trust = None
             for signum, handler in previous:
@@ -181,7 +188,10 @@ class Session:
             "mitm": self.mitm.server if self.mitm.port else None,
             "flows": count,
             "files": {
+                "har": "session.har",
+                "scripts": "scripts.json",
                 "flows": "flows.jsonl",
+                "script_reports": "scripts-live.jsonl",
                 "mitmproxy": "flows.mitm",
                 "storage": "storage.json",
                 "profile": "profile",
@@ -190,3 +200,18 @@ class Session:
         }
         self.out.mkdir(parents=True, exist_ok=True)
         (self.out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    def _write_har(self) -> None:
+        from oby.har import HAR_NAME, write_har
+
+        try:
+            write_har(self.mitm.record_path, self.out / HAR_NAME)
+        except Exception as exc:
+            import sys
+
+            print(f"oby: could not write {HAR_NAME}: {exc}", file=sys.stderr)
+
+    def _write_scripts(self) -> None:
+        from oby.scripts import write_session_scripts
+
+        write_session_scripts(self.out, self.mitm.record_path, self.mitm.scripts_path)

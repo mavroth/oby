@@ -174,6 +174,7 @@ def test_mcp_env_points_firefox_at_the_open_recorder(tmp_path: Path):
     assert env["REQUESTS_CA_BUNDLE"] == str(trust)
     assert env["SSL_CERT_FILE"] == str(trust)
     assert env["INVISIBLE_MCP_SESSION_ID"] == f"oby-{os.getpid()}"
+    assert env["OBY_OUT"] == str(tmp_path.resolve())
     command = mcp_command()
     assert command[0] == sys.executable
     assert command[1:] == ["-m", "oby.mcp_entry"]

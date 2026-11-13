@@ -13,12 +13,17 @@ pip install -e .
 oby --proxy 'http://user:pass@host:port' --out session --url https://example.com
 ```
 
-The first launch downloads the Firefox engine (about 260 MB) and checks its sha256. Close the window, or press Ctrl+C. `session/` then holds:
+The first launch downloads the Firefox engine (about 260 MB) and checks its sha256. Close the window, or press Ctrl+C. The file written at the end is `session/session.har`, a HAR 1.2 log. Header order, casing, and repeated cookies are the header arrays. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result. `session/scripts.json` is written beside it and lists the JavaScript that ran.
+
+`session/` also holds:
 
 | file | what |
 | --- | --- |
-| `flows.jsonl` | every exchange: ordered headers, bodies, status, the mitmcloak preset used |
-| `flows.mitm` | the same capture in mitmproxy's own format |
+| `session.har` | the recording, written when the session ends |
+| `scripts.json` | the JavaScript that ran, written when the session ends |
+| `flows.jsonl` | the same exchanges, written as they finish, which the HAR is built from |
+| `scripts-live.jsonl` | eval, new Function, timers, and blob workers, written as they run |
+| `flows.mitm` | the capture in mitmproxy's own format |
 | `storage.json` | cookies and localStorage, from `oby browse` |
 | `profile/` | the Firefox profile, so the next run is the same browser |
 | `presets/` | TLS presets mitmcloak exported from this session |
@@ -38,7 +43,15 @@ Firefox will not use a Chromium certificate flag. The context accepts the record
 
 `oby mcp` starts the same recorder, then runs [invisible-playwright-mcp](https://github.com/oss-invisible/playwright_mcp) on stdio. The agent's browser tools are that server's tools. The server is pointed at the recorder with `STEALTHFOX_PROXY=http://127.0.0.1:<port>`. On a Mac the default visible session opens in Screen Sharing. `oby mcp --headless` does not.
 
-`flows.jsonl` stores the block as `request_header_block`: order, casing, and repeated names. On HTTP/2 the preface is `http2.pseudo_order` and `http2.settings`. HTTP/2 lowercases names on the wire, so odd casing is an HTTP/1.1 property. The same preface is what mitmcloak replays upstream, in `presets/`.
+The server's instructions tell the agent how the recording works: the browser talks only to the local recorder, exchanges land in `flows.jsonl` while the visit goes on, and `session.har` and `scripts.json` are written when the client closes. The tool `oby_recording` returns that folder, both paths, and the counts. It does not return cookies, header values, or script source.
+
+## JavaScript that ran
+
+`scripts.json` holds every script Oby could see. A fetched `.js` file and an inline `<script>` come from the recording. `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, and a blob worker are reported by a hook that runs before the page. The hook watches the global `eval`, `Function`, `setTimeout`, `setInterval`, `Worker`, and `SharedWorker`.
+
+[Ghostwire](https://github.com/sofianeelhor/ghostwire) records these same kinds on Chrome by listening to the debugger. This Firefox has no script-parsed debugger, so the hook is ordinary page JavaScript and a site can see it. The report is posted to `https://oby-scripts.invalid/collect`. The recorder answers that name itself, and the exchange is left out of the HAR. When the site's Content-Security-Policy would block the report, the browser also receives `connect-src` for that name. The saved header is the one the site sent.
+
+`flows.jsonl` stores the block as `request_header_block`: order, casing, and repeated names. On HTTP/2 the preface is `http2.pseudo_order` and `http2.settings`. HTTP/2 lowercases names on the wire, so odd casing is an HTTP/1.1 property. The same preface is what mitmcloak replays upstream, in `presets/`. The HAR keeps that preface on `entry._oby.http2`.
 
 Set `OBY_PROXY` in the environment when the origin should be reached through an upstream proxy. The first start downloads the engine before the server answers, so the client timeout is several minutes.
 

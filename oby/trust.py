@@ -77,3 +77,11 @@ def accept_recorder_certificate() -> None:
 
     wrapped._oby_trust = True  # type: ignore[attr-defined]
     CommonLaunch._default_context_kwargs = wrapped  # type: ignore[method-assign]
+    try:
+        from oby.scripts import install_script_watcher
+
+        install_script_watcher()
+    except Exception as exc:
+        import sys
+
+        print(f"oby: could not install the script watcher: {exc}", file=sys.stderr)

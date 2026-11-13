@@ -11,6 +11,11 @@ def main() -> None:
     from oby.trust import accept_recorder_certificate
 
     accept_recorder_certificate()
+    from invisible_playwright_mcp.mcp import server as mcp_server
+
+    from oby.mcp import teach
+
+    teach(mcp_server)
     from invisible_playwright_mcp.cli import main as serve
 
     serve()
