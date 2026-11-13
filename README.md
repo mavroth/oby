@@ -21,6 +21,16 @@ oby --url https://example.com
 
 Close the window, or press Ctrl+C. Oby writes `session/session.har` and `session/scripts.json`.
 
+## For an agent
+
+Install the instructions for this release:
+
+```bash
+npx skills add mavroth/oby@v0.1.0 --skill oby
+```
+
+`npx skills add mavroth/oby --skill oby` follows the default branch. The skill is [`skills/oby/SKILL.md`](skills/oby/SKILL.md). It tells an agent how to run `oby browse` and `oby mcp`, and which files to keep.
+
 Published Firefox engines are Windows x86_64 and Linux x86_64. On a Mac, Oby runs that Linux engine in Docker (`linux/amd64`). Docker Desktop has to be running. The first start builds an image and downloads the engine, about 260 MB, and checks its sha256. The recording stays in the `--out` folder on the Mac. A visible session opens in Screen Sharing. The share has no password and listens on this machine only.
 
 ## What you get
