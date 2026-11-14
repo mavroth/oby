@@ -161,7 +161,7 @@ RECORDING_INSTRUCTIONS = """Oby is recording this browser. The browser talks onl
 
 Header order, the original casing, and repeated Cookie headers are kept. On HTTP/2 the client's preface, its pseudo-header order and settings, is kept with the exchange.
 
-While you work, exchanges land in flows.jsonl in the output folder. The file to take away is session.har. Oby writes it once, when this client closes. It is a HAR 1.2 log of those exchanges. Headers stay in wire order. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result. The log's `_oby` object points at scripts.json.
+While you work, exchanges land in flows.jsonl in the output folder. Firefox writes its own startup traffic first. The page you opened follows. On a Mac the engine starts in Docker, so that request can take about half a minute. A flows.jsonl that only names Firefox hosts in that window is the start of the visit. Each launch clears the previous flows.jsonl, script logs, scripts.json, and session.har in this folder. The profile stays. The file to take away is session.har. Oby writes it once, when this client closes. It is a HAR 1.2 log of those exchanges. Headers stay in wire order. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result. The log's `_oby` object points at scripts.json.
 
 scripts.json is written at the same time. It lists the JavaScript that ran. Firefox reports each script it parses, on a debugger that listens on 127.0.0.1 and does not pause the page: fetched files, inline scripts, eval, new Function, string timers, blob workers, dedicated workers, and scripts inserted into the page. The engine preference that would ignore that listener is turned off. A page cannot read the preference. If the listener does not start, a page hook reports eval, new Function, string timers, and blob workers instead, and a site can see that hook. Its report is left out of the HAR.
 
@@ -206,11 +206,13 @@ def recording_report() -> dict:
 def recording() -> str:
     """Where this visit is recorded, and when session.har and scripts.json appear.
 
-    Each exchange is written as it finishes. session.har and scripts.json are
-    written when the client closes. scripts.json lists the JavaScript Firefox
-    parsed: files, inline scripts, eval, new Function, timers, blob workers,
-    dedicated workers, and scripts inserted into the page. This returns the folder, both paths,
-    and the counts. It does not return cookies, header values, or script source.
+    Each exchange is written as it finishes. Firefox's own startup traffic is
+    written first, and the page request follows. session.har and scripts.json
+    are written when the client closes. scripts.json lists the JavaScript
+    Firefox parsed: files, inline scripts, eval, new Function, timers, blob
+    workers, dedicated workers, and scripts inserted into the page. This
+    returns the folder, both paths, and the counts. It does not return
+    cookies, header values, or script source.
     """
     return json.dumps(recording_report())
 

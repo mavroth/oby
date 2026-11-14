@@ -23,6 +23,18 @@ oby --url https://example.com
 
 Close the window, or press Ctrl+C. Oby writes `session/session.har` and `session/scripts.json`.
 
+On a Mac, start Docker Desktop first. Oby runs the published Linux Firefox engine there. The same commands run on Linux and Windows without that image.
+
+## How a visit runs
+
+`oby browse` opens the window and records into `--out` (`session/` when you leave it off). `oby mcp` records the same browser for an agent and writes the HAR when the client closes.
+
+Firefox's own startup requests are saved first. The page you asked for follows. On a Mac the engine is starting in Docker, so that page can be about half a minute after the first line in `flows.jsonl`. A folder that only shows Firefox hosts in that window still has the visit ahead of it. `scripts.json` is written when the session ends.
+
+Each launch clears `flows.jsonl`, `scripts-parsed.jsonl`, `scripts-live.jsonl`, `scripts.json`, and `session.har` in that folder, then records this visit. The profile stays, so the next run is the same browser.
+
+The document waits at most 8 seconds so the debugger is listening before a dedicated worker starts. The browser then sends its own request.
+
 ## For an agent
 
 Install the instructions for this release:
@@ -109,7 +121,7 @@ with Session(proxy="http://user:pass@host:port", out="session") as s:
 oby mcp --out session
 ```
 
-The server's instructions tell the agent how the recording works. Exchanges land in `flows.jsonl` during the visit. `session.har` and `scripts.json` are written when the client closes. The tool `oby_recording` returns the folder, both paths, and the counts. It returns none of the cookies, header values, or script source.
+The server's instructions tell the agent how the recording works. Exchanges land in `flows.jsonl` during the visit. Firefox's own startup traffic is written first, and the page follows. `session.har` and `scripts.json` are written when the client closes. The tool `oby_recording` returns the folder, both paths, and the counts. It returns none of the cookies, header values, or script source.
 
 The browser tools change the page, so an assistant confirms each one until the server is allowed. [`.claude/settings.json`](.claude/settings.json) allows every tool on the `oby` server. Claude Code and Grok read that file. The first time you open the project, trust the folder. That question is the only one. After it, the agent opens the browser, navigates, and clicks without asking again. If a client still offers a choice on one tool, choose always allow for `oby`.
 

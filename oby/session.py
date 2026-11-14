@@ -91,10 +91,8 @@ class Session:
         return self
 
     def goto(self, url: str):
-        from oby.parsed import wait_until_attached
-
-        # The page's scripts are only reported after this thread is attached.
-        wait_until_attached(12)
+        # page.goto waits until the debugger is listening, then sends this
+        # document. Waiting here as well kept the request off the recorder.
         self.url = url
         return self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 

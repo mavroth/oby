@@ -81,6 +81,25 @@ def test_har_document_is_empty_but_valid():
     assert log["pages"][0]["startedDateTime"].endswith("Z")
 
 
+def test_a_new_visit_starts_from_an_empty_capture(tmp_path: Path):
+    from oby.proxy import reset_capture
+
+    (tmp_path / "flows.jsonl").write_text('{"url":"https://old.example/"}\n', encoding="utf-8")
+    (tmp_path / "scripts-parsed.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "scripts-live.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "scripts.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "session.har").write_text("{}", encoding="utf-8")
+    reset_capture(tmp_path)
+    for name in (
+        "flows.jsonl",
+        "scripts-parsed.jsonl",
+        "scripts-live.jsonl",
+        "scripts.json",
+        "session.har",
+    ):
+        assert not (tmp_path / name).exists()
+
+
 def test_exchange_records_timestamps():
     flow = _Flow()
     flow.request.timestamp_start = 10.0

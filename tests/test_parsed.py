@@ -186,10 +186,17 @@ def test_an_http_page_thread_is_paused_so_workers_can_be_armed(tmp_path):
     assert listener._pause_threads == {"thr"}
 
 
-def test_the_document_route_is_removed_before_its_body_runs():
-    from oby.parsed import _hold_documents, begin_document, mark_document_thread
+def test_the_document_route_is_removed_before_its_body_runs(monkeypatch):
+    from oby import parsed
+    from oby.parsed import _hold_documents
 
     events = []
+
+    def note_wait(timeout=8):
+        events.append(("wait", timeout))
+        return True
+
+    monkeypatch.setattr(parsed, "wait_for_document_thread", note_wait)
 
     class Request:
         resource_type = "document"
@@ -220,16 +227,16 @@ def test_the_document_route_is_removed_before_its_body_runs():
 
     page = Page()
     _hold_documents(page, "http://127.0.0.1:9/?q=1#section")
-    begin_document()
-    mark_document_thread()
     page.context.handler(Route())
     assert events[0][0] == "route"
     assert events[0][2] is True
     assert "\\?" in events[0][1]
     assert [step[0] if isinstance(step, tuple) else step for step in events[1:]] == [
+        "wait",
         "unroute",
         "continue",
     ]
+    assert events[1][1] == 8
 
 
 def test_a_connected_worker_waits_until_its_script_can_load(tmp_path):

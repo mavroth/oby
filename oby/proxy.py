@@ -19,6 +19,25 @@ from oby import collect, record
 from oby.scripts import LIVE_NAME, SAVE_FILTER
 
 
+def reset_capture(out: Path) -> None:
+    """Drop the previous visit's logs so this visit starts empty.
+
+    The recorder appends. A reused folder otherwise still holds the last
+    browser's startup traffic, and a reader can report that the new page
+    never loaded.
+    """
+    from oby.har import HAR_NAME
+    from oby.parsed import PARSED_NAME
+    from oby.scripts import SCRIPTS_NAME
+
+    out.mkdir(parents=True, exist_ok=True)
+    for name in ("flows.jsonl", LIVE_NAME, PARSED_NAME, SCRIPTS_NAME, HAR_NAME):
+        try:
+            (out / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def redact_proxy(url: str | None) -> str | None:
     """Drop userinfo so a saved session does not keep the proxy password."""
     if not url:
@@ -120,6 +139,7 @@ class Mitm:
 
     def start(self) -> str:
         self.out.mkdir(parents=True, exist_ok=True)
+        reset_capture(self.out)
         self.confdir.mkdir(parents=True, exist_ok=True)
         (self.out / "presets").mkdir(exist_ok=True)
         (self.out / "seen").mkdir(exist_ok=True)

@@ -67,9 +67,11 @@ Give the first `oby mcp` start several minutes. The engine download finishes bef
 The project allows every tool on the `oby` server (`.claude/settings.json`). After the folder is trusted once, do not ask the person before each browser tool.
 
 1. Call `browser_open` before any other browser tool. With no arguments it restores the seed, proxy, and profile for this process.
-2. Go where you were asked.
-3. Call `oby_recording` for the folder, `session.har`, `scripts.json`, and the counts. A client may prefix the tool name.
+2. Go where you were asked. Firefox writes its own startup traffic first. The page follows. On a Mac, allow about a minute after navigation before you decide the page is missing.
+3. Call `oby_recording` for the folder, `session.har`, `scripts.json`, and the counts. During the visit it counts exchanges so far. A client may prefix the tool name.
 4. Close the MCP client. That write produces `session.har` and `scripts.json`. Until then, exchanges are in `flows.jsonl`.
+
+Each launch of `oby browse` or `oby mcp` clears `flows.jsonl`, the script logs, `scripts.json`, and `session.har` in `--out`, then records this visit. The profile stays.
 
 `oby_recording` returns paths and counts. It does not return cookies, header values, or script source. Leave those in the folder. Do not print them, the proxy password, or the egress address. Treat the output folder like a password.
 

@@ -257,12 +257,7 @@ def _route_pattern(url: str) -> str:
 
 
 def _drop_route(context, pattern: str, handler) -> None:
-    """Take the interception down before the document runs.
-
-    Leaving any route installed keeps a dedicated worker from requesting its
-    script once the debugger is attached. The in-flight document is continued
-    by the caller after this returns.
-    """
+    """Remove this document's route. A route left installed blocks a worker."""
     uninstall = getattr(context, "unroute", None)
     if not callable(uninstall):
         return
@@ -272,12 +267,28 @@ def _drop_route(context, pattern: str, handler) -> None:
         return None
 
 
-def _hold_documents(page, url: str | None = None) -> None:
-    """Hold only this document, and only until its thread is attached.
+# The new page thread usually attaches while this document is paused, which
+# is what lets a dedicated worker be reported. Cap the pause so a thread
+# that arrives only with the body cannot hide the visit: the request is
+# continued when the cap is reached.
+_DOCUMENT_HOLD = 8.0
 
-    The watcher has to be listening before the parser starts workers.
-    Interception is removed before the body is released, so the worker's own
-    request is not routed.
+
+def _document_navigation(route) -> bool:
+    request = getattr(route, "request", None)
+    kind = getattr(request, "resource_type", "") if request is not None else ""
+    navigation = getattr(request, "is_navigation_request", None)
+    if kind != "document":
+        return False
+    return not (callable(navigation) and not navigation())
+
+
+def _hold_documents(page, url: str | None = None) -> None:
+    """Pause this document briefly, then send the browser's own request.
+
+    The watcher has to be listening before a dedicated worker starts. The
+    pause is capped. The route is removed before the body is released, and
+    the request is continued even when that removal fails.
     """
     if not url or os.environ.get("OBY_PARSED_NO_HOLD") == "1":
         return
@@ -299,32 +310,32 @@ def _hold_documents(page, url: str | None = None) -> None:
         return
 
     def release(route) -> None:
-        request = getattr(route, "request", None)
-        kind = getattr(request, "resource_type", "") if request is not None else ""
-        navigation = getattr(request, "is_navigation_request", None)
-        if kind != "document" or (callable(navigation) and not navigation()):
+        if not _document_navigation(route):
             route.continue_()
             return
-        wait_for_document_thread(8)
-        _drop_route(context, pattern, release)
-        route.continue_()
+        wait_for_document_thread(_DOCUMENT_HOLD)
+        try:
+            _drop_route(context, pattern, release)
+        finally:
+            route.continue_()
 
     if inspect.iscoroutinefunction(getattr(page, "goto", None)):
 
         async def handler(route):
-            request = getattr(route, "request", None)
-            kind = getattr(request, "resource_type", "") if request is not None else ""
-            navigation = getattr(request, "is_navigation_request", None)
-            if kind != "document" or (callable(navigation) and not navigation()):
+            if not _document_navigation(route):
                 await route.continue_()
                 return
             import asyncio
 
-            await asyncio.get_running_loop().run_in_executor(None, wait_for_document_thread, 8)
-            dropped = _drop_route(context, pattern, handler)
-            if inspect.isawaitable(dropped):
-                await dropped
-            await route.continue_()
+            await asyncio.get_running_loop().run_in_executor(
+                None, wait_for_document_thread, _DOCUMENT_HOLD
+            )
+            try:
+                dropped = _drop_route(context, pattern, handler)
+                if inspect.isawaitable(dropped):
+                    await dropped
+            finally:
+                await route.continue_()
     else:
         handler = release
     try:
