@@ -32,3 +32,5 @@ def test_skill_matches_the_release_people_install():
     assert pin in readme
     assert "session.har" in skill
     assert "scripts.json" in skill
+    settings = (ROOT / ".claude" / "settings.json").read_text(encoding="utf-8")
+    assert "mcp__oby" in settings

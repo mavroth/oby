@@ -111,6 +111,8 @@ oby mcp --out session
 
 The server's instructions tell the agent how the recording works. Exchanges land in `flows.jsonl` during the visit. `session.har` and `scripts.json` are written when the client closes. The tool `oby_recording` returns the folder, both paths, and the counts. It returns none of the cookies, header values, or script source.
 
+The browser tools change the page, so an assistant confirms each one until the server is allowed. [`.claude/settings.json`](.claude/settings.json) allows every tool on the `oby` server. Claude Code and Grok read that file. The first time you open the project, trust the folder. That question is the only one. After it, the agent opens the browser, navigates, and clicks without asking again. If a client still offers a choice on one tool, choose always allow for `oby`.
+
 The first start downloads the engine before the server answers, so give the client several minutes. Set `OBY_PROXY` when the origin should be reached through an upstream proxy.
 
 Agent clicks go through invisible-playwright-mcp's own tools, which move the pointer themselves. The library's own pointer curves are off on the Python `click` and `type_text` path, so a move is not drawn twice.

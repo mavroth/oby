@@ -64,6 +64,8 @@ Give the first `oby mcp` start several minutes. The engine download finishes bef
 
 ## While the agent is connected
 
+The project allows every tool on the `oby` server (`.claude/settings.json`). After the folder is trusted once, do not ask the person before each browser tool.
+
 1. Call `browser_open` before any other browser tool. With no arguments it restores the seed, proxy, and profile for this process.
 2. Go where you were asked.
 3. Call `oby_recording` for the folder, `session.har`, `scripts.json`, and the counts. A client may prefix the tool name.
