@@ -91,7 +91,7 @@ def docker_build_argv(repo: Path) -> list[str]:
         "--progress", "plain",
         "-t", IMAGE,
         "-f", str(repo / "docker" / "Dockerfile"),
-        str(repo / "docker"),
+        str(repo),
     ]
 
 

@@ -77,6 +77,6 @@ Give the first `oby mcp` start several minutes. The engine download finishes bef
 
 `session.har` is a HAR 1.2 log. Header order is the header arrays. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result.
 
-`scripts.json` lists the JavaScript that ran: fetched script files, inline scripts, `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, and a blob worker. The hook watches the global `eval`, `Function`, `setTimeout`, `setInterval`, `Worker`, and `SharedWorker`. A call that never goes through those is absent. The hook is ordinary page JavaScript, so a site can see it. Its collector exchange is not a HAR entry.
+`scripts.json` is the Firefox counterpart of the script list [Ghostwire](https://github.com/sofianeelhor/ghostwire) records on Chrome: every script the engine parsed, read from the debugger, with nothing injected into the page. It includes fetched files, inline scripts, `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, a blob worker, a dedicated worker loaded from its own URL, and a script inserted into the page. The listener is Firefox's remote debugger on loopback. It does not pause the page. `zoom.stealth.debugger.force_detach` is turned off so those scripts are reported. A page cannot read that preference. Attaching can change how the engine compiles a script. If the listener does not start, a page hook is the fallback and a site can see it. The hook's collector exchange is not a HAR entry.
 
 The repository README is the long description of every file in the folder.

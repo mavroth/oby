@@ -20,6 +20,7 @@ from oby.scripts import (
     WATCH_SOURCE,
     _arm,
     _arm_sync,
+    allow_script_report,
     answer_sink,
     append_report,
     install_script_watcher,
@@ -131,6 +132,15 @@ def test_executed_scripts_include_network_inline_and_eval(tmp_path: Path, monkey
     assert "scripts.json" in document([])["log"]["_oby"]["scripts"]
 
 
+def test_a_live_debugger_leaves_the_policy(tmp_path: Path, monkeypatch):
+    flag = tmp_path / "debugger.ready"
+    flag.write_text("ok\n", encoding="utf-8")
+    monkeypatch.setenv("OBY_PARSED_FLAG", str(flag))
+    page = _page()
+    allow_script_report(page)
+    assert page.response.headers.get("content-security-policy") == "connect-src 'self'"
+
+
 def test_policy_gains_the_collector_once():
     once = relax_policy("connect-src 'self'")
     assert once == f"connect-src 'self' {SINK_ORIGIN}"
@@ -204,6 +214,8 @@ def test_watcher_is_installed_on_the_context():
 
     assert SyncPW.__enter__._oby_scripts is True
     assert AsyncPW.__aenter__._oby_scripts is True
+    assert SyncPW.__init__._oby_parsed is True
+    assert AsyncPW.__init__._oby_parsed is True
 
 
 def test_recording_report_counts_scripts_and_hides_source(tmp_path: Path, monkeypatch):
@@ -237,4 +249,4 @@ def test_recording_report_counts_scripts_and_hides_source(tmp_path: Path, monkey
     teach(mcp_server)
     instructions = mcp_server.mcp._mcp_server.instructions
     assert "scripts.json" in instructions
-    assert "The hook sees calls that go through the global eval" in instructions
+    assert "Firefox reports each script it parses" in instructions

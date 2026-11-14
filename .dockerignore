@@ -1,6 +1,9 @@
 .venv
 session
 .git
+.grok
+.mcp.json
+.playwright-mcp
 **/__pycache__
 *.egg-info
 .pytest_cache

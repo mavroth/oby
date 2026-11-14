@@ -2,9 +2,11 @@
 
 Oby records a browser session as the browser sent it.
 
-You get one Firefox window, one local recorder, and a folder. The folder holds a HAR of the traffic, the JavaScript that ran, the cookies, and the profile. An upstream proxy is optional. You can drive the window yourself, or hand the same browser to an agent.
+You get one Firefox window, one local recorder, and a folder. The folder holds a HAR of the traffic, every script Firefox parsed, the cookies, and the profile. An upstream proxy is optional. You can drive the window yourself, or hand the same browser to an agent.
 
 The browser is [invisible-playwright](https://github.com/oss-invisible/playwright), a patched Firefox. [mitmcloak](https://github.com/sardanioss/mitmcloak) mirrors that browser's TLS on the way out, so header order and the HTTP/2 preface stay intact. Scripted clicks in the Python API follow a [Cursory](https://github.com/Vinyzu/cursory) path.
+
+[Ghostwire](https://github.com/sofianeelhor/ghostwire) instruments Chrome from the debugger and records every script the engine parses, including `eval`, `new Function`, and workers, with nothing injected into the page. Oby records that same script list on Firefox.
 
 Copyright (c) 2026 [mavroth](https://github.com/mavroth). Released under the MIT license.
 
@@ -38,9 +40,10 @@ Published Firefox engines are Windows x86_64 and Linux x86_64. On a Mac, Oby run
 | file | what |
 | --- | --- |
 | `session.har` | HAR 1.2 of the visit, written when the session ends |
-| `scripts.json` | the JavaScript that ran, written when the session ends |
+| `scripts.json` | every script Firefox parsed, written when the session ends |
 | `flows.jsonl` | the same exchanges, written as they finish |
-| `scripts-live.jsonl` | `eval`, `new Function`, timers, and blob workers, written as they run |
+| `scripts-parsed.jsonl` | each script as Firefox parsed it |
+| `scripts-live.jsonl` | the page-hook reports, only if the debugger did not start |
 | `flows.mitm` | the capture in mitmproxy's own format |
 | `storage.json` | cookies and localStorage, from `oby browse` |
 | `profile/` | the Firefox profile, so the next run is the same browser |
@@ -53,14 +56,19 @@ Header order, the original casing, and repeated `Cookie` headers are the header 
 
 ## JavaScript that ran
 
-`scripts.json` lists the scripts Oby could see:
+This is the Firefox counterpart of Ghostwire's script list. The debugger reports each script as the engine parses it. The page is not given a hook to do it.
 
-- a fetched script file, and an inline `<script>`, taken from the recording
-- `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, and a blob worker, reported by a hook that runs before the page
+`scripts.json` is that list, taken from `scripts-parsed.jsonl`. The source is the engine's copy, so a fetched file is stored whole even when the saved response body is shorter.
 
-The hook watches the global `eval`, `Function`, `setTimeout`, `setInterval`, `Worker`, and `SharedWorker`.
+- a fetched script file
+- an inline `<script>`, and a script inserted into the page
+- `eval`, `new Function`, and a string passed to `setTimeout` or `setInterval`
+- a blob worker
+- a dedicated worker loaded from its own URL
 
-[Ghostwire](https://github.com/sofianeelhor/ghostwire) records these same kinds on Chrome by listening to the debugger. This Firefox has no script-parsed debugger, so the hook is ordinary page JavaScript and a site can see it. The report is posted to `https://oby-scripts.invalid/collect`. The recorder answers that name itself, and that exchange stays out of the HAR. When the site's Content-Security-Policy would block the report, the browser also receives `connect-src` for that name. The header saved in the HAR is the one the site sent.
+The listener is Firefox's remote debugger on `127.0.0.1`. It does not pause the page and it sets no breakpoints. This engine normally ignores that debugger (`zoom.stealth.debugger.force_detach`). Oby turns the preference off so the parsed scripts are reported. A page cannot read the preference. Attaching can change how the engine compiles a script.
+
+If the debugger does not start, Oby falls back to a page hook. The hook watches the global `eval`, `Function`, `setTimeout`, `setInterval`, `Worker`, and `SharedWorker`, and a site can see it. The report is posted to `https://oby-scripts.invalid/collect`. The recorder answers that name itself, and that exchange stays out of the HAR. When the site's Content-Security-Policy would block the report, the browser also receives `connect-src` for that name. The header saved in the HAR is the one the site sent. A live debugger leaves that header alone.
 
 ## Proxy
 

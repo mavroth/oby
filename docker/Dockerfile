@@ -55,4 +55,8 @@ RUN pip install --no-cache-dir \
  && python -c "from invisible_playwright import ensure_binary; ensure_binary()" \
  && chmod -R a+rX /opt/invisible
 
+# Worker threads have no prefs service. Patch attach() before Firefox starts.
+COPY oby/enginefix.py /tmp/oby_enginefix.py
+RUN python /tmp/oby_enginefix.py
+
 WORKDIR /src

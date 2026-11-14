@@ -1,13 +1,14 @@
 """JavaScript that ran during a session.
 
-Network files and inline scripts come from the recorded exchanges. eval,
-new Function, string timers, and blob workers never cross the wire, so a
-hook installed before the page posts them to a name this recorder answers
-itself. Ghostwire records those same kinds on Chrome by listening to the
-debugger. This Firefox has no script-parsed debugger, so the hook is page
-JavaScript and a site can see it.
+Firefox's remote debugger reports every script the engine parses, including
+fetched files, inline scripts, eval, new Function, string timers, blob
+workers, and scripts inserted into the page. That log is preferred.
 
-The collector exchange is not part of the page recording.
+When the debugger does not start, network files and inline scripts come from
+the recorded exchanges, and a hook installed before the page posts eval,
+new Function, string timers, and blob workers to a name this recorder answers
+itself. The hook is page JavaScript and a site can see it. The collector
+exchange is not part of the page recording.
 """
 
 from __future__ import annotations
@@ -36,14 +37,22 @@ POST_CAP = 2_000
 MAX_SCRIPTS = 4_000
 DYNAMIC_KINDS = ("eval", "function", "timer", "blob")
 
-NOTE = (
+HOOK_NOTE = (
     "JavaScript that ran in this session. "
-    "Network files and inline scripts are taken from the recording. "
+    "The parsed-script listener did not record this visit, so network files and inline scripts are taken from the recording. "
     "eval, new Function, string timers, and blob workers are reported by a hook that runs before the page. "
     "The hook sees calls that go through the global eval, Function, setTimeout, setInterval, Worker, and SharedWorker. "
-    "This Firefox has no script-parsed debugger, so the hook is page JavaScript and a site can see it. "
-    "Ghostwire records these same kinds on Chrome by listening to the debugger."
+    "The hook is page JavaScript and a site can see it."
 )
+PARSED_NOTE = (
+    "JavaScript Firefox parsed in this session. "
+    "The remote debugger on loopback reported each script, including fetched files, inline scripts, "
+    "eval, new Function, string timers, blob workers, dedicated workers, and scripts inserted into the page. "
+    "The page was not paused. "
+    "zoom.stealth.debugger.force_detach was turned off so the engine would report these scripts. "
+    "A page cannot read that preference. Attaching can change how the engine compiles a script."
+)
+NOTE = HOOK_NOTE
 
 _JS_MIME = {
     "text/javascript",
@@ -432,13 +441,20 @@ def patch_html(text: str) -> str:
     return _META.sub(repl, text)
 
 
+def parsed_debugger_ready() -> bool:
+    """True once the parsed-script listener is attached for this process."""
+    flag = os.environ.get("OBY_PARSED_FLAG")
+    return bool(flag) and os.path.exists(flag)
+
+
 def allow_script_report(flow) -> None:
     """Widen connect-src on the copy the browser receives.
 
     Call this after the exchange has been snapshotted. The saved header stays
-    the one the site sent. A meta policy is patched the same way.
+    the one the site sent. A meta policy is patched the same way. The parsed
+    script listener does not need this, so a live debugger leaves the policy.
     """
-    if is_sink_flow(flow):
+    if parsed_debugger_ready() or is_sink_flow(flow):
         return
     response = getattr(flow, "response", None)
     if response is None:
@@ -517,8 +533,13 @@ def _body_text(body: dict) -> str | None:
     return text
 
 
-def make_item(kind: str, url: str, source: str, truncated: bool) -> dict:
-    source, cut = clip(source)
+def make_item(kind: str, url: str, source: str, truncated: bool, *, limit: bool = True) -> dict:
+    # The debugger text is the engine's copy, so a vendor bundle stays whole.
+    # The wire body and the page hook stay on MAX_SOURCE.
+    if limit:
+        source, cut = clip(source)
+    else:
+        cut = False
     item = {
         "kind": kind,
         "url": url,
@@ -550,6 +571,21 @@ def from_exchange(row: dict) -> list[dict]:
     if is_html(ctype):
         items.extend(make_item("inline", url, source, truncated) for source in inline_scripts(text))
     return items
+
+
+def from_parsed(row: dict) -> dict | None:
+    source = row.get("source")
+    if not isinstance(source, str) or source == "":
+        return None
+    kind = row.get("kind")
+    if kind not in {"network", "inline", *DYNAMIC_KINDS}:
+        kind = "inline"
+    url = row.get("url") if isinstance(row.get("url"), str) else ""
+    item = make_item(kind, url[:2048], source, bool(row.get("truncated")), limit=False)
+    introduction = row.get("introduction")
+    if isinstance(introduction, str) and introduction:
+        item["introduction"] = introduction
+    return item
 
 
 def from_report(row: dict) -> dict | None:
@@ -613,12 +649,12 @@ def counts_of(items: list[dict]) -> dict[str, int]:
     return counts
 
 
-def document(items: list[dict]) -> dict:
+def document(items: list[dict], *, note: str = NOTE) -> dict:
     truncated = len(items) > MAX_SCRIPTS
     kept = items[:MAX_SCRIPTS]
     body = {
         "version": 1,
-        "note": NOTE,
+        "note": note,
         "counts": counts_of(kept),
         "scripts": kept,
     }
@@ -627,25 +663,41 @@ def document(items: list[dict]) -> dict:
     return body
 
 
-def write_scripts(flows: Path, live: Path, dest: Path) -> int:
-    """Write dest from the capture and the hook reports. Returns how many scripts."""
-    body = document(gather(flows, live))
+def choose_items(flows: Path, live: Path, parsed: Path | None = None) -> tuple[list[dict], str]:
+    """Prefer the engine's parsed scripts. The hook list is the fallback."""
+    if parsed is not None and parsed.is_file() and parsed.stat().st_size > 0:
+        items = []
+        for row in _rows(parsed):
+            item = from_parsed(row)
+            if item is not None:
+                items.append(item)
+        return _dedupe(items), PARSED_NOTE
+    return gather(flows, live), HOOK_NOTE
+
+
+def write_scripts(flows: Path, live: Path, dest: Path, parsed: Path | None = None) -> int:
+    """Write dest from parsed scripts, or from the capture and the hook. Returns how many."""
+    items, note = choose_items(flows, live, parsed)
+    body = document(items, note=note)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
     return len(body["scripts"])
 
 
 def write_session_scripts(out: Path, flows: Path, live: Path) -> None:
+    from oby.parsed import PARSED_NAME, stop_listener
+
+    stop_listener()
     try:
-        write_scripts(flows, live, out / SCRIPTS_NAME)
+        write_scripts(flows, live, out / SCRIPTS_NAME, out / PARSED_NAME)
     except Exception as exc:
         print(f"oby: could not write {SCRIPTS_NAME}: {exc}", file=sys.stderr)
 
 
-def progress(flows: Path, live: Path) -> dict:
+def progress(flows: Path, live: Path, parsed: Path | None = None) -> dict:
     """Counts only. Script source stays in the session folder."""
     try:
-        items = gather(flows, live)
+        items, _note = choose_items(flows, live, parsed)
     except Exception:
         items = []
     counts = counts_of(items)
@@ -653,13 +705,16 @@ def progress(flows: Path, live: Path) -> dict:
 
 
 def install_script_watcher() -> None:
-    """Install the hook on both the sync browser and the async one the agent uses."""
+    """Listen for parsed scripts, and keep the page hook when that listener fails."""
     global _installed
     if _installed:
         return
     from invisible_playwright.async_api import InvisiblePlaywright as AsyncPW
     from invisible_playwright.launcher import InvisiblePlaywright as SyncPW
 
+    from oby.parsed import install_on
+
+    install_on(SyncPW, AsyncPW)
     _wrap_enter(SyncPW, "__enter__", awaitable=False)
     _wrap_enter(AsyncPW, "__aenter__", awaitable=True)
     _installed = True
@@ -673,13 +728,19 @@ def _wrap_enter(cls, name: str, *, awaitable: bool) -> None:
 
         async def wrapped(self, *args, **kwargs):
             result = await original(self, *args, **kwargs)
-            await _arm(result)
+            if not _debugger_ready(self):
+                await _arm(result)
+            else:
+                _arm_navigation(result)
             return result
     else:
 
         def wrapped(self, *args, **kwargs):
             result = original(self, *args, **kwargs)
-            _arm_sync(result)
+            if not _debugger_ready(self):
+                _arm_sync(result)
+            else:
+                _arm_navigation(result)
             return result
 
     wrapped._oby_scripts = True  # type: ignore[attr-defined]
@@ -756,6 +817,25 @@ def _wrap_new_context(result, *, awaitable: bool) -> None:
         result.new_context = wrapped
     except Exception:
         pass
+
+
+def _arm_navigation(result) -> None:
+    try:
+        from oby.parsed import arm_navigation
+
+        arm_navigation(result)
+    except Exception as exc:
+        _warn(exc)
+
+
+def _debugger_ready(launcher) -> bool:
+    try:
+        from oby.parsed import start_parsed
+
+        return bool(start_parsed(launcher))
+    except Exception as exc:
+        _warn(exc)
+        return False
 
 
 def _warn(exc: BaseException) -> None:

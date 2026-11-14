@@ -121,7 +121,7 @@ def test_build_uses_the_linux_dockerfile(tmp_path: Path):
     assert cmd[:4] == ["docker", "build", "--platform", "linux/amd64"]
     assert "-t" in cmd and "oby-linux:firefox" in cmd
     assert str(tmp_path / "docker" / "Dockerfile") in cmd
-    assert cmd[-1] == str(tmp_path / "docker")
+    assert cmd[-1] == str(tmp_path)
 
 
 def test_missing_docker_is_a_clean_error(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):

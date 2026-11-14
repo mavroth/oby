@@ -18,7 +18,12 @@ def main() -> None:
     teach(mcp_server)
     from invisible_playwright_mcp.cli import main as serve
 
-    serve()
+    try:
+        serve()
+    finally:
+        from oby.parsed import stop_listener
+
+        stop_listener()
 
 
 if __name__ == "__main__":

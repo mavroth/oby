@@ -54,7 +54,7 @@ def document(rows: list[dict]) -> dict:
             "_oby": {
                 "headers": "wire order, original casing, repeated names",
                 "entry": "each entry._oby carries the HTTP/2 preface and mitmcloak result",
-                "scripts": "scripts.json lists the JavaScript that ran. The collector exchange is not an entry.",
+                "scripts": "scripts.json lists the JavaScript the engine parsed. The page-hook collector, used only when that listener is down, is not an entry.",
             },
         }
     }

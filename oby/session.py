@@ -59,6 +59,9 @@ class Session:
             # published binary fails before a proxy is left listening.
             from invisible_playwright import InvisiblePlaywright, ensure_binary
 
+            from oby.parsed import prepare_output
+
+            prepare_output(self.out)
             ensure_binary()
             self.started_at = _now()
             self.mitm.start()
@@ -88,6 +91,10 @@ class Session:
         return self
 
     def goto(self, url: str):
+        from oby.parsed import wait_until_attached
+
+        # The page's scripts are only reported after this thread is attached.
+        wait_until_attached(12)
         self.url = url
         return self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
@@ -192,6 +199,7 @@ class Session:
                 "scripts": "scripts.json",
                 "flows": "flows.jsonl",
                 "script_reports": "scripts-live.jsonl",
+                "parsed_scripts": "scripts-parsed.jsonl",
                 "mitmproxy": "flows.mitm",
                 "storage": "storage.json",
                 "profile": "profile",

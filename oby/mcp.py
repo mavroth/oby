@@ -63,6 +63,9 @@ def run_mcp(*, proxy: str | None, out: Path, headless: bool) -> int:
 
     print("oby: checking the Firefox engine", file=sys.stderr)
     ensure_binary()
+    from oby.parsed import prepare_output
+
+    prepare_output(out)
     mitm = Mitm(out, upstream=proxy)
     profile = out / "profile"
     profile.mkdir(parents=True, exist_ok=True)
@@ -127,6 +130,7 @@ def _write_meta(out: Path, mitm: Mitm, proxy: str | None, started: str) -> None:
             "scripts": "scripts.json",
             "flows": "flows.jsonl",
             "script_reports": "scripts-live.jsonl",
+            "parsed_scripts": "scripts-parsed.jsonl",
             "mitmproxy": "flows.mitm",
             "profile": "profile",
             "presets": "presets",
@@ -159,7 +163,7 @@ Header order, the original casing, and repeated Cookie headers are kept. On HTTP
 
 While you work, exchanges land in flows.jsonl in the output folder. The file to take away is session.har. Oby writes it once, when this client closes. It is a HAR 1.2 log of those exchanges. Headers stay in wire order. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result. The log's `_oby` object points at scripts.json.
 
-scripts.json is written at the same time. It lists the JavaScript that ran. Script files and inline scripts come from the recording. eval, new Function, string timers, and blob workers are reported by a hook that runs before the page's own scripts. The hook sees calls that go through the global eval, Function, setTimeout, setInterval, Worker, and SharedWorker. This Firefox has no script-parsed debugger, so the hook is page JavaScript and a site can see it. The report goes to a name the recorder answers itself, and that exchange is left out of the HAR.
+scripts.json is written at the same time. It lists the JavaScript that ran. Firefox reports each script it parses, on a debugger that listens on 127.0.0.1 and does not pause the page: fetched files, inline scripts, eval, new Function, string timers, blob workers, dedicated workers, and scripts inserted into the page. The engine preference that would ignore that listener is turned off. A page cannot read the preference. If the listener does not start, a page hook reports eval, new Function, string timers, and blob workers instead, and a site can see that hook. Its report is left out of the HAR.
 
 Call oby_recording to read the folder, the HAR path, the scripts path, and how many exchanges and scripts are on disk so far. That tool returns none of the cookies, none of the header values, and none of the script source. session.har and scripts.json contain them. Treat the folder like a password.
 
@@ -181,9 +185,10 @@ def recording_report() -> dict:
     scripts_ready = bool(root) and (root / "scripts.json").is_file()
     counted = {"total": 0, "by_kind": {}}
     if root is not None:
+        from oby.parsed import PARSED_NAME
         from oby.scripts import progress
 
-        counted = progress(root / "flows.jsonl", root / "scripts-live.jsonl")
+        counted = progress(root / "flows.jsonl", root / "scripts-live.jsonl", root / PARSED_NAME)
     return {
         "output_dir": shown,
         "har": f"{folder}/session.har" if folder else "session.har",
@@ -202,10 +207,10 @@ def recording() -> str:
     """Where this visit is recorded, and when session.har and scripts.json appear.
 
     Each exchange is written as it finishes. session.har and scripts.json are
-    written when the client closes. scripts.json lists the JavaScript that ran:
-    network files, inline scripts, eval, new Function, timers, and blob workers.
-    This returns the folder, both paths, and the counts. It does not return
-    cookies, header values, or script source.
+    written when the client closes. scripts.json lists the JavaScript Firefox
+    parsed: files, inline scripts, eval, new Function, timers, blob workers,
+    dedicated workers, and scripts inserted into the page. This returns the folder, both paths,
+    and the counts. It does not return cookies, header values, or script source.
     """
     return json.dumps(recording_report())
 
