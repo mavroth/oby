@@ -1,58 +1,46 @@
 """JavaScript that ran during a session.
 
-Firefox's remote debugger reports every script the engine parses, including
-fetched files, inline scripts, eval, new Function, string timers, blob
-workers, and scripts inserted into the page. That log is preferred.
+The DevTools watch in chrome.py reads every script V8 parses, including
+fetched files, inline scripts, eval, new Function, string timers, and blob
+workers, and writes them to scripts-parsed.jsonl. That log is the list.
 
-When the debugger does not start, network files and inline scripts come from
-the recorded exchanges, and a hook installed before the page posts eval,
-new Function, string timers, and blob workers to a name this recorder answers
-itself. The hook is page JavaScript and a site can see it. The collector
-exchange is not part of the page recording.
+A fetched file or an inline script whose text the watch did not get is read
+back from the recorded exchange. When the watch did not attach at all, the
+list is the fetched files and inline scripts in the recording.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import inspect
 import json
-import os
 import re
 import sys
-import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SINK_HOST = "oby-scripts.invalid"
-SINK_URL = f"https://{SINK_HOST}/collect"
-SINK_ORIGIN = f"https://{SINK_HOST}"
 SCRIPTS_NAME = "scripts.json"
-LIVE_NAME = "scripts-live.jsonl"
-# mitmdump's save filter. Dots are regex. Keeps the collector out of flows.mitm.
-SAVE_FILTER = r"!(~d oby-scripts\.invalid)"
-
-MAX_SOURCE = 500_000
-POST_CAP = 2_000
-MAX_SCRIPTS = 4_000
+PARSED_NAME = "scripts-parsed.jsonl"
+SCRIPTS_DIR = "scripts"
+# No limit on a script's length or on how many are listed. A number here
+# cuts at that point and marks the result truncated.
+MAX_SOURCE: int | None = None
+MAX_SCRIPTS: int | None = None
 DYNAMIC_KINDS = ("eval", "function", "timer", "blob")
 
-HOOK_NOTE = (
-    "JavaScript that ran in this session. "
-    "The parsed-script listener did not record this visit, so network files and inline scripts are taken from the recording. "
-    "eval, new Function, string timers, and blob workers are reported by a hook that runs before the page. "
-    "The hook sees calls that go through the global eval, Function, setTimeout, setInterval, Worker, and SharedWorker. "
-    "The hook is page JavaScript and a site can see it."
+WIRE_NOTE = (
+    "JavaScript in this session's recording. "
+    "The DevTools watch did not attach, so this is the fetched files and inline scripts in the recorded responses. "
+    "eval, new Function, string timers, and blob workers are not listed."
 )
 PARSED_NOTE = (
-    "JavaScript Firefox parsed in this session. "
-    "The remote debugger on loopback reported each script, including fetched files, inline scripts, "
-    "eval, new Function, string timers, blob workers, dedicated workers, and scripts inserted into the page. "
-    "The page was not paused. "
-    "zoom.stealth.debugger.force_detach was turned off so the engine would report these scripts. "
-    "A page cannot read that preference. Attaching can change how the engine compiles a script."
+    "JavaScript Chrome parsed in this session. "
+    "A DevTools client on loopback read each script from V8 as it was parsed, including fetched files, inline scripts, "
+    "eval, new Function, string timers, blob workers, and workers. "
+    "Nothing was injected into the page and the page was not paused. "
+    "new Function is told from eval by its source. A string timer is listed as eval."
 )
-NOTE = HOOK_NOTE
+NOTE = PARSED_NOTE
 
 _JS_MIME = {
     "text/javascript",
@@ -77,407 +65,10 @@ _HTML_MIME = {"text/html", "application/xhtml+xml"}
 _SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.IGNORECASE | re.DOTALL)
 _TYPE_ATTR = re.compile(r"""\btype\s*=\s*(['"]?)([^'"\s>]+)\1""", re.IGNORECASE)
 _SRC_ATTR = re.compile(r"""\bsrc\s*=""", re.IGNORECASE)
-_META = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
-_HTTP_EQUIV = re.compile(
-    r"""http-equiv\s*=\s*(['"]?)content-security-policy\1""",
-    re.IGNORECASE,
-)
-_CONTENT = re.compile(r"""content\s*=\s*(['"])(.*?)\1""", re.IGNORECASE | re.DOTALL)
-
-_lock = threading.Lock()
-_posted = 0
-_installed = False
-_warned = False
-
-# Tokens are replaced below. The page source stays free of a format string.
-_WATCH = r"""
-(() => {
-  var root = globalThis;
-  if (root.__obyWatch) return;
-  try {
-    Object.defineProperty(root, "__obyWatch", { value: 1, enumerable: false });
-  } catch (e) {
-    try { root.__obyWatch = 1; } catch (e2) { return; }
-  }
-  var SINK = __SINK__;
-  var LIMIT = __LIMIT__;
-
-  function send(kind, source) {
-    try {
-      if (typeof source !== "string" || source.length === 0) return;
-      var text = source.length > LIMIT ? source.slice(0, LIMIT) : source;
-      var body = JSON.stringify({
-        kind: kind,
-        source: text,
-        url: (root.location && root.location.href) || ""
-      });
-      fetch(SINK, {
-        method: "POST",
-        mode: "no-cors",
-        credentials: "omit",
-        cache: "no-store",
-        keepalive: true,
-        headers: { "content-type": "text/plain" },
-        body: body
-      }).catch(function () {});
-    } catch (e) {}
-  }
-
-  function spoof(fn, name) {
-    var printed = "function " + name + "() {\n    [native code]\n}";
-    var tos = function toString() { return printed; };
-    var tosPrinted = "function toString() {\n    [native code]\n}";
-    var tosTos = function toString() { return tosPrinted; };
-    try { Object.defineProperty(tosTos, "toString", { value: tosTos }); } catch (e) {}
-    try { Object.defineProperty(tos, "toString", { value: tosTos }); } catch (e2) {}
-    try { Object.defineProperty(fn, "toString", { value: tos }); } catch (e3) {}
-    try { Object.defineProperty(fn, "name", { value: name }); } catch (e4) {}
-    try { Object.defineProperty(fn, "length", { value: 1 }); } catch (e5) {}
-    return fn;
-  }
-
-  var blobText = new WeakMap();
-  var blobUrls = {};
-  var blobUrlCount = 0;
-
-  function rememberBlob(href, text) {
-    if (typeof blobUrls[href] === "string") {
-      blobUrls[href] = text;
-      return;
-    }
-    if (blobUrlCount >= 200) return;
-    blobUrls[href] = text;
-    blobUrlCount++;
-  }
-
-  function blobSource(seq) {
-    if (typeof seq === "string") return seq;
-    if (!seq || seq.length == null) return "";
-    var bits = [];
-    for (var i = 0; i < seq.length; i++) {
-      if (typeof seq[i] === "string") bits.push(seq[i]);
-    }
-    return bits.join("");
-  }
-
-  var RealBlob = root.Blob;
-  if (typeof RealBlob === "function") {
-    var wrappedBlob = spoof(function Blob() {
-      var blob = Reflect.construct(RealBlob, arguments, new.target || RealBlob);
-      try {
-        var text = blobSource(arguments[0]);
-        if (text) blobText.set(blob, text);
-      } catch (e) {}
-      return blob;
-    }, "Blob");
-    try {
-      Object.setPrototypeOf(wrappedBlob, RealBlob);
-      wrappedBlob.prototype = RealBlob.prototype;
-    } catch (e) {}
-    try {
-      Object.defineProperty(root, "Blob", { value: wrappedBlob, configurable: true, writable: true });
-    } catch (e2) {
-      try { root.Blob = wrappedBlob; } catch (e3) {}
-    }
-  }
-
-  var urlApi = root.URL;
-  if (urlApi && typeof urlApi.createObjectURL === "function") {
-    var realCreate = urlApi.createObjectURL;
-    var wrappedCreate = spoof(function createObjectURL(obj) {
-      var href = realCreate.call(urlApi, obj);
-      try {
-        var text = blobText.get(obj);
-        if (typeof text === "string" && String(href).indexOf("blob:") === 0) rememberBlob(String(href), text);
-      } catch (e) {}
-      return href;
-    }, "createObjectURL");
-    try {
-      Object.defineProperty(urlApi, "createObjectURL", { value: wrappedCreate, configurable: true, writable: true });
-    } catch (e) {
-      try { urlApi.createObjectURL = wrappedCreate; } catch (e2) {}
-    }
-  }
-
-  function noteUrl(kind, scriptUrl) {
-    try {
-      var href = String(scriptUrl && scriptUrl.url ? scriptUrl.url : scriptUrl);
-      if (href.indexOf("blob:") === 0) {
-        if (typeof blobUrls[href] === "string") {
-          send(kind, blobUrls[href]);
-          return;
-        }
-        fetch(href).then(function (r) { return r.text(); }).then(function (t) { send(kind, t); }).catch(function () {});
-      } else if (href.indexOf("data:") === 0) {
-        var comma = href.indexOf(",");
-        var meta = comma >= 0 ? href.slice(0, comma) : "";
-        var data = comma >= 0 ? href.slice(comma + 1) : href;
-        if (meta.indexOf(";base64") !== -1) {
-          try { data = atob(data); } catch (e) {}
-        } else {
-          try { data = decodeURIComponent(data); } catch (e2) {}
-        }
-        send(kind, data);
-      }
-    } catch (e) {}
-  }
-
-  var realEval = root.eval;
-  var wrappedEval = spoof(function eval(code) {
-    if (typeof code === "string") send("eval", code);
-    return realEval(code);
-  }, "eval");
-  try {
-    Object.defineProperty(root, "eval", { value: wrappedEval, configurable: true, writable: true });
-  } catch (e) {
-    try { root.eval = wrappedEval; } catch (e2) {}
-  }
-
-  var RealFunction = root.Function;
-  var wrappedFunction = spoof(function Function() {
-    var parts = [];
-    for (var i = 0; i < arguments.length; i++) parts.push(String(arguments[i]));
-    send("function", parts.join("\n"));
-    return Reflect.construct(RealFunction, arguments, new.target || RealFunction);
-  }, "Function");
-  try {
-    Object.setPrototypeOf(wrappedFunction, RealFunction);
-    wrappedFunction.prototype = RealFunction.prototype;
-  } catch (e) {}
-  try {
-    Object.defineProperty(root, "Function", { value: wrappedFunction, configurable: true, writable: true });
-  } catch (e2) {
-    try { root.Function = wrappedFunction; } catch (e3) {}
-  }
-
-  function wrapTimer(name) {
-    var real = root[name];
-    if (typeof real !== "function") return;
-    var wrapped = spoof(function () {
-      if (typeof arguments[0] === "string") send("timer", arguments[0]);
-      return real.apply(this, arguments);
-    }, name);
-    try {
-      Object.defineProperty(root, name, { value: wrapped, configurable: true, writable: true });
-    } catch (e) {}
-  }
-  wrapTimer("setTimeout");
-  wrapTimer("setInterval");
-
-  function wrapCtor(name) {
-    var Real = root[name];
-    if (typeof Real !== "function") return;
-    var wrapped = spoof(function () {
-      noteUrl("blob", arguments[0]);
-      return Reflect.construct(Real, arguments, new.target || Real);
-    }, name);
-    try {
-      Object.setPrototypeOf(wrapped, Real);
-      wrapped.prototype = Real.prototype;
-    } catch (e) {}
-    try {
-      Object.defineProperty(root, name, { value: wrapped, configurable: true, writable: true });
-    } catch (e2) {
-      try { root[name] = wrapped; } catch (e3) {}
-    }
-  }
-  wrapCtor("Worker");
-  wrapCtor("SharedWorker");
-})();
-"""
-
-WATCH_SOURCE = _WATCH.replace("__SINK__", json.dumps(SINK_URL)).replace("__LIMIT__", str(MAX_SOURCE))
-
-
-def is_sink_host(host: str) -> bool:
-    name = host.lower().strip()
-    if name.startswith("["):
-        return False
-    return name.split(":", 1)[0] == SINK_HOST
-
-
-def is_sink_url(url: str) -> bool:
-    try:
-        return (urlsplit(url).hostname or "").lower() == SINK_HOST
-    except ValueError:
-        return False
-
-
-def is_sink_flow(flow) -> bool:
-    request = getattr(flow, "request", None)
-    if request is None:
-        return False
-    host = getattr(request, "host", None)
-    if isinstance(host, bytes):
-        host = host.decode("latin-1", "replace")
-    if host and is_sink_host(str(host)):
-        return True
-    return is_sink_url(str(getattr(request, "pretty_url", None) or ""))
-
-
 def clip(source: str) -> tuple[str, bool]:
-    if len(source) > MAX_SOURCE:
+    if MAX_SOURCE and len(source) > MAX_SOURCE:
         return source[:MAX_SOURCE], True
     return source, False
-
-
-def append_report(raw: bytes, dest: str | None = None) -> None:
-    """Store one hook report. The path defaults to OBY_SCRIPTS."""
-    global _posted
-    if not raw:
-        return
-    path = dest or os.environ.get("OBY_SCRIPTS")
-    if not path:
-        return
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    source = payload.get("source")
-    if not isinstance(source, str) or source == "":
-        return
-    kind = payload.get("kind")
-    if kind not in DYNAMIC_KINDS:
-        kind = "eval"
-    source, truncated = clip(source)
-    url = payload.get("url")
-    if not isinstance(url, str):
-        url = ""
-    line = {"kind": kind, "source": source, "url": url[:2048]}
-    if truncated:
-        line["truncated"] = True
-    with _lock:
-        if _posted >= POST_CAP:
-            return
-        _posted += 1
-        folder = os.path.dirname(path)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(line, ensure_ascii=False) + "\n")
-            handle.flush()
-
-
-def answer_sink(flow) -> bool:
-    """Reply to the collector and keep the body off the upstream proxy.
-
-    mitmcloak returns immediately when a response is already set, so this has
-    to run in an addon loaded before it.
-    """
-    if not is_sink_flow(flow):
-        return False
-    if getattr(flow, "response", None) is None:
-        request = getattr(flow, "request", None)
-        method = str(getattr(request, "method", "") or "").upper()
-        if method == "POST" and request is not None:
-            raw = getattr(request, "raw_content", None)
-            if raw is None:
-                raw = getattr(request, "content", None)
-            if raw:
-                try:
-                    append_report(raw)
-                except Exception:
-                    pass
-        try:
-            from mitmproxy import http
-
-            flow.response = http.Response.make(
-                204,
-                b"",
-                {
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-store",
-                },
-            )
-        except Exception:
-            return False
-    return True
-
-
-def relax_policy(policy: str) -> str:
-    """Let the page post the hook report. Other directives stay as the site sent them."""
-    chunks = []
-    for part in policy.split(";"):
-        part = part.strip()
-        if part:
-            chunks.append(part.split())
-    if not chunks:
-        return policy
-    names = [chunk[0].lower() for chunk in chunks if chunk]
-    if "connect-src" in names:
-        index = names.index("connect-src")
-        chunks[index] = _with_origin(chunks[index])
-    elif "default-src" in names:
-        index = names.index("default-src")
-        chunks.append(_with_origin(["connect-src", *chunks[index][1:]]))
-    else:
-        return policy
-    return "; ".join(" ".join(chunk) for chunk in chunks)
-
-
-def _with_origin(tokens: list[str]) -> list[str]:
-    if any(token.lower() == SINK_ORIGIN.lower() for token in tokens):
-        return tokens
-    body = [token for token in tokens[1:] if token.lower() not in {"'none'", "none"}]
-    return [tokens[0], *body, SINK_ORIGIN]
-
-
-def patch_html(text: str) -> str:
-    """Add the collector to a meta Content-Security-Policy, when the page has one."""
-
-    def repl(match: re.Match) -> str:
-        tag = match.group(0)
-        if not _HTTP_EQUIV.search(tag):
-            return tag
-
-        def content_repl(inner: re.Match) -> str:
-            quote = inner.group(1)
-            return f"content={quote}{relax_policy(inner.group(2))}{quote}"
-
-        return _CONTENT.sub(content_repl, tag, count=1)
-
-    return _META.sub(repl, text)
-
-
-def parsed_debugger_ready() -> bool:
-    """True once the parsed-script listener is attached for this process."""
-    flag = os.environ.get("OBY_PARSED_FLAG")
-    return bool(flag) and os.path.exists(flag)
-
-
-def allow_script_report(flow) -> None:
-    """Widen connect-src on the copy the browser receives.
-
-    Call this after the exchange has been snapshotted. The saved header stays
-    the one the site sent. A meta policy is patched the same way. The parsed
-    script listener does not need this, so a live debugger leaves the policy.
-    """
-    if parsed_debugger_ready() or is_sink_flow(flow):
-        return
-    response = getattr(flow, "response", None)
-    if response is None:
-        return
-    headers = getattr(response, "headers", None)
-    if headers is not None and hasattr(headers, "get_all") and hasattr(headers, "set_all"):
-        values = headers.get_all("content-security-policy")
-        if values:
-            headers.set_all("content-security-policy", [relax_policy(value) for value in values])
-    if headers is None or not hasattr(headers, "get"):
-        return
-    if "html" not in str(headers.get("content-type", "") or "").lower():
-        return
-    raw = getattr(response, "content", None)
-    if not raw:
-        return
-    try:
-        text = raw.decode("utf-8")
-    except (AttributeError, UnicodeDecodeError):
-        return
-    patched = patch_html(text)
-    if patched != text:
-        response.content = patched.encode("utf-8")
 
 
 def inline_scripts(html: str) -> list[str]:
@@ -535,7 +126,7 @@ def _body_text(body: dict) -> str | None:
 
 def make_item(kind: str, url: str, source: str, truncated: bool, *, limit: bool = True) -> dict:
     # The debugger text is the engine's copy, so a vendor bundle stays whole.
-    # The wire body and the page hook stay on MAX_SOURCE.
+    # The wire body is whole too unless MAX_SOURCE is set.
     if limit:
         source, cut = clip(source)
     else:
@@ -555,8 +146,6 @@ def make_item(kind: str, url: str, source: str, truncated: bool, *, limit: bool 
 
 def from_exchange(row: dict) -> list[dict]:
     url = str(row.get("url") or "")
-    if is_sink_url(url):
-        return []
     response = row.get("response_body")
     if not isinstance(response, dict):
         return []
@@ -588,17 +177,6 @@ def from_parsed(row: dict) -> dict | None:
     return item
 
 
-def from_report(row: dict) -> dict | None:
-    source = row.get("source")
-    if not isinstance(source, str) or source == "":
-        return None
-    kind = row.get("kind")
-    if kind not in DYNAMIC_KINDS:
-        kind = "eval"
-    url = row.get("url") if isinstance(row.get("url"), str) else ""
-    return make_item(kind, url[:2048], source, bool(row.get("truncated")))
-
-
 def _rows(path: Path) -> list[dict]:
     if not path.is_file():
         return []
@@ -615,14 +193,10 @@ def _rows(path: Path) -> list[dict]:
     return rows
 
 
-def gather(flows: Path, live: Path) -> list[dict]:
+def gather(flows: Path) -> list[dict]:
     items: list[dict] = []
     for row in _rows(flows):
         items.extend(from_exchange(row))
-    for row in _rows(live):
-        item = from_report(row)
-        if item is not None:
-            items.append(item)
     return _dedupe(items)
 
 
@@ -650,8 +224,8 @@ def counts_of(items: list[dict]) -> dict[str, int]:
 
 
 def document(items: list[dict], *, note: str = NOTE) -> dict:
-    truncated = len(items) > MAX_SCRIPTS
-    kept = items[:MAX_SCRIPTS]
+    truncated = bool(MAX_SCRIPTS) and len(items) > MAX_SCRIPTS
+    kept = items[:MAX_SCRIPTS] if truncated else items
     body = {
         "version": 1,
         "note": note,
@@ -663,184 +237,149 @@ def document(items: list[dict], *, note: str = NOTE) -> dict:
     return body
 
 
-def choose_items(flows: Path, live: Path, parsed: Path | None = None) -> tuple[list[dict], str]:
-    """Prefer the engine's parsed scripts. The hook list is the fallback."""
+def choose_items(flows: Path, parsed: Path | None = None) -> tuple[list[dict], str]:
+    """The engine's parsed scripts. The recording alone is the fallback."""
     if parsed is not None and parsed.is_file() and parsed.stat().st_size > 0:
         items = []
         for row in _rows(parsed):
             item = from_parsed(row)
             if item is not None:
                 items.append(item)
-        return _dedupe(items), PARSED_NOTE
-    return gather(flows, live), HOOK_NOTE
+        unfetched = [row for row in _rows(parsed) if row.get("unfetched")]
+        # A file whose text was cut off part way is owed in the same way.
+        cut = [item for item in items if item["kind"] == "network" and item.get("truncated")]
+        whole = [item for item in items if item not in cut]
+        filled = wire_fill(whole, unfetched + cut, flows)
+        found = {item["url"] for item in filled}
+        kept = whole + [item for item in cut if item["url"] not in found]
+        asked = script_requests(kept + filled, flows)
+        return _dedupe(kept + filled + asked), PARSED_NOTE
+    return gather(flows), WIRE_NOTE
 
 
-def write_scripts(flows: Path, live: Path, dest: Path, parsed: Path | None = None) -> int:
-    """Write dest from parsed scripts, or from the capture and the hook. Returns how many."""
-    items, note = choose_items(flows, live, parsed)
+def wire_fill(parsed: list[dict], unfetched: list[dict], flows: Path) -> list[dict]:
+    """Scripts the engine parsed whose text the watch did not get in time.
+
+    The engine names each script as it is parsed and gives the text on
+    request. A page that closes first takes the unanswered texts with it,
+    and the watch then records the name alone. A fetched file is in the
+    recording either way, so its text is taken from there and the item says
+    `from: wire`. Only a script the debugger named is filled here.
+    script_requests adds a file that was fetched to run and never named.
+    """
+    have = {(item["kind"], item["url"]) for item in parsed}
+    wanted = {
+        (row["kind"], row["url"])
+        for row in unfetched
+        if isinstance(row.get("url"), str)
+        and row.get("kind") in ("network", "inline")
+        and (row["kind"], row["url"]) not in have
+    }
+    if not wanted:
+        return []
+    urls = {url for _kind, url in wanted}
+    filled: list[dict] = []
+    for row in _rows(flows):
+        if row.get("url") not in urls:
+            continue
+        for item in from_exchange(row):
+            # A document's inline scripts all share its URL, so all are taken.
+            if (item["kind"], item["url"]) in wanted:
+                item["from"] = "wire"
+                filled.append(item)
+        urls.discard(row.get("url"))
+    return filled
+
+
+# What the browser puts in Sec-Fetch-Dest when the response is going to be run.
+_RUN_DESTS = frozenset({"script", "worker", "sharedworker", "serviceworker", "audioworklet", "paintworklet"})
+
+
+def script_requests(have: list[dict], flows: Path) -> list[dict]:
+    """Files the browser fetched to run that the engine never named.
+
+    The watch can miss a script: one that arrives as the page is leaving,
+    or one in a thread it had not attached to yet. The request still says
+    what the file was for. A browser sends Sec-Fetch-Dest: script only for a
+    script element, a module import, or a script preload, so a 200 answer
+    to it is JavaScript the page asked to run. The item says `from: wire`
+    and `reported: false`, because the engine did not confirm it was
+    parsed. A preload the page never used is the one case where it was not.
+    """
+    known = {item["url"] for item in have if item["kind"] == "network"}
+    added: list[dict] = []
+    for row in _rows(flows):
+        url = row.get("url")
+        if not isinstance(url, str) or url in known or row.get("status") != 200:
+            continue
+        dest = ""
+        for pair in row.get("request_headers") or []:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and str(pair[0]).lower() == "sec-fetch-dest":
+                dest = str(pair[1]).strip().lower()
+        if dest not in _RUN_DESTS:
+            continue
+        for item in from_exchange(row):
+            if item["kind"] == "network":
+                item["from"] = "wire"
+                item["reported"] = False
+                added.append(item)
+                known.add(url)
+    return added
+
+
+def write_scripts(flows: Path, dest: Path, parsed: Path | None = None) -> int:
+    """Write dest from the parsed scripts, or from the recording alone. Returns how many."""
+    items, note = choose_items(flows, parsed)
     body = document(items, note=note)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    try:
+        write_script_files(body["scripts"], dest.parent / SCRIPTS_DIR)
+        body["files"] = f"{SCRIPTS_DIR}/<sha256>.js holds each script's source on its own"
+    except OSError as exc:
+        print(f"oby: could not write {SCRIPTS_DIR}/: {exc}", file=sys.stderr)
+    partial = dest.with_name(dest.name + ".part")
+    partial.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    partial.replace(dest)
     return len(body["scripts"])
 
 
-def write_session_scripts(out: Path, flows: Path, live: Path) -> None:
-    from oby.parsed import PARSED_NAME, stop_listener
+def write_script_files(items: list[dict], folder: Path) -> int:
+    """Write each distinct source to folder/<sha256>.js, and name it on the item.
 
-    stop_listener()
+    scripts.json keeps the source as well. The files are for grep, a
+    formatter, or a diff, which read a file and not a JSON string.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for item in items:
+        digest = item.get("sha256")
+        source = item.get("source")
+        if not isinstance(digest, str) or not isinstance(source, str):
+            continue
+        path = folder / f"{digest}.js"
+        item["file"] = f"{folder.name}/{path.name}"
+        if path.exists():
+            continue
+        path.write_text(source, encoding="utf-8", errors="surrogatepass")
+        written += 1
+    return written
+
+
+def write_session_scripts(out: Path, flows: Path) -> None:
+    from oby.chrome import stop_watch
+
+    stop_watch()
     try:
-        write_scripts(flows, live, out / SCRIPTS_NAME, out / PARSED_NAME)
+        write_scripts(flows, out / SCRIPTS_NAME, out / PARSED_NAME)
     except Exception as exc:
         print(f"oby: could not write {SCRIPTS_NAME}: {exc}", file=sys.stderr)
 
 
-def progress(flows: Path, live: Path, parsed: Path | None = None) -> dict:
+def progress(flows: Path, parsed: Path | None = None) -> dict:
     """Counts only. Script source stays in the session folder."""
     try:
-        items, _note = choose_items(flows, live, parsed)
+        items, _note = choose_items(flows, parsed)
     except Exception:
         items = []
     counts = counts_of(items)
     return {"total": sum(counts.values()), "by_kind": counts}
-
-
-def install_script_watcher() -> None:
-    """Listen for parsed scripts, and keep the page hook when that listener fails."""
-    global _installed
-    if _installed:
-        return
-    from invisible_playwright.async_api import InvisiblePlaywright as AsyncPW
-    from invisible_playwright.launcher import InvisiblePlaywright as SyncPW
-
-    from oby.parsed import install_on
-
-    install_on(SyncPW, AsyncPW)
-    _wrap_enter(SyncPW, "__enter__", awaitable=False)
-    _wrap_enter(AsyncPW, "__aenter__", awaitable=True)
-    _installed = True
-
-
-def _wrap_enter(cls, name: str, *, awaitable: bool) -> None:
-    original = getattr(cls, name)
-    if getattr(original, "_oby_scripts", False):
-        return
-    if awaitable:
-
-        async def wrapped(self, *args, **kwargs):
-            result = await original(self, *args, **kwargs)
-            if not _debugger_ready(self):
-                await _arm(result)
-            else:
-                _arm_navigation(result)
-            return result
-    else:
-
-        def wrapped(self, *args, **kwargs):
-            result = original(self, *args, **kwargs)
-            if not _debugger_ready(self):
-                _arm_sync(result)
-            else:
-                _arm_navigation(result)
-            return result
-
-    wrapped._oby_scripts = True  # type: ignore[attr-defined]
-    setattr(cls, name, wrapped)
-
-
-def _arm_sync(result) -> None:
-    add = _adder(result)
-    if add is None:
-        _wrap_new_context(result, awaitable=False)
-        return
-    try:
-        handle = add(WATCH_SOURCE)
-    except Exception as exc:
-        _warn(exc)
-        return
-    if inspect.isawaitable(handle):
-        handle.close()
-        _warn(RuntimeError("the sync browser returned an awaitable init script"))
-        return
-    _remember(result, handle)
-
-
-async def _arm(result) -> None:
-    add = _adder(result)
-    if add is None:
-        _wrap_new_context(result, awaitable=True)
-        return
-    try:
-        handle = add(WATCH_SOURCE)
-        if inspect.isawaitable(handle):
-            handle = await handle
-    except Exception as exc:
-        _warn(exc)
-        return
-    _remember(result, handle)
-
-
-def _adder(result):
-    if getattr(result, "_oby_script_handle", None) is not None:
-        return None
-    add = getattr(result, "add_init_script", None)
-    if not callable(add):
-        return None
-    return add
-
-
-def _remember(result, handle) -> None:
-    try:
-        setattr(result, "_oby_script_handle", handle)
-    except Exception:
-        pass
-
-
-def _wrap_new_context(result, *, awaitable: bool) -> None:
-    new_context = getattr(result, "new_context", None)
-    if not callable(new_context) or getattr(new_context, "_oby_scripts", False):
-        return
-    if awaitable:
-
-        async def wrapped(*args, **kwargs):
-            ctx = await new_context(*args, **kwargs)
-            await _arm(ctx)
-            return ctx
-    else:
-
-        def wrapped(*args, **kwargs):
-            ctx = new_context(*args, **kwargs)
-            _arm_sync(ctx)
-            return ctx
-
-    wrapped._oby_scripts = True  # type: ignore[attr-defined]
-    try:
-        result.new_context = wrapped
-    except Exception:
-        pass
-
-
-def _arm_navigation(result) -> None:
-    try:
-        from oby.parsed import arm_navigation
-
-        arm_navigation(result)
-    except Exception as exc:
-        _warn(exc)
-
-
-def _debugger_ready(launcher) -> bool:
-    try:
-        from oby.parsed import start_parsed
-
-        return bool(start_parsed(launcher))
-    except Exception as exc:
-        _warn(exc)
-        return False
-
-
-def _warn(exc: BaseException) -> None:
-    global _warned
-    if _warned:
-        return
-    _warned = True
-    print(f"oby: could not install the script watcher: {exc}", file=sys.stderr)

@@ -32,5 +32,11 @@ def test_skill_matches_the_release_people_install():
     assert pin in readme
     assert "session.har" in skill
     assert "scripts.json" in skill
+    assert "The page follows." in skill
+    assert "The profile stays." in skill
+    assert "The page you asked for follows." in readme
+    assert "Firefox" not in readme and "Firefox" not in skill
+    assert "Docker" not in readme and "Docker" not in skill
+    assert "See what loaded" in readme
     settings = (ROOT / ".claude" / "settings.json").read_text(encoding="utf-8")
     assert "mcp__oby" in settings

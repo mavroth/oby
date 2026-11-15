@@ -18,7 +18,7 @@ def _build() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="oby",
-        description="Record a stealth Firefox session as a HAR, including the JavaScript that ran.",
+        description="Record a stealth browser session as a HAR, including the JavaScript that ran.",
     )
     sub = parser.add_subparsers(dest="cmd")
 
@@ -26,7 +26,7 @@ def _build() -> argparse.ArgumentParser:
         "browse",
         parents=[common],
         help="Open a window you drive yourself",
-        description="Open Firefox and record the visit. session.har and scripts.json are written when the window closes.",
+        description="Open the browser and record the visit. session.har and scripts.json are written when the window closes.",
     )
     browse.add_argument("--url", default=None)
     browse.add_argument("--headless", action="store_true")
@@ -35,7 +35,7 @@ def _build() -> argparse.ArgumentParser:
         "mcp",
         parents=[common],
         help="Let an agent drive the browser",
-        description="Start the same recorder and let an agent drive Firefox. session.har and scripts.json are written when the client closes.",
+        description="Start the same recorder and let an agent drive the browser. session.har and scripts.json are written when the client closes.",
     )
     agent.add_argument("--headless", action="store_true", help="Hide the window. Default is visible.")
     return parser
@@ -50,20 +50,14 @@ def main(argv: list[str] | None = None) -> int:
         raw = ["browse", *raw]
     args = _build().parse_args(raw)
     proxy = _proxy(args.proxy)
-    from oby.linuxbox import needs_linux_engine, run_in_linux
-
-    if needs_linux_engine():
-        return run_in_linux(raw, proxy=proxy, out=Path(args.out), headless=args.headless)
     if args.cmd == "mcp":
         return _mcp(proxy, Path(args.out), args.headless)
     return _browse(proxy, Path(args.out), args.url, args.headless)
 
 
 def _save_on_term() -> None:
-    # Docker's stop path delivers SIGTERM. Python would die before close()
-    # wrote the recording. Treat it like Ctrl+C.
-    if os.environ.get("OBY_LINUX_HOST") != "1":
-        return
+    # A client closing its server, or a service manager, delivers SIGTERM.
+    # Python would die before close() wrote the recording. Treat it like Ctrl+C.
     signal.signal(signal.SIGTERM, _raise_interrupt)
 
 
@@ -75,9 +69,7 @@ def _browse(proxy: str | None, out: Path, url: str | None, headless: bool) -> in
     from oby.session import Session
 
     _save_on_term()
-    # On a Mac the process that prints this is inside the container, where the
-    # recording is mounted at /out. OBY_HOST_OUT is the folder on the Mac.
-    label = os.environ.get("OBY_HOST_OUT") or out
+    label = out
     print(f"Recording into {label}", flush=True)
     if proxy:
         print("Upstream proxy is set. The browser itself talks only to the local recorder.")
@@ -92,14 +84,9 @@ def _browse(proxy: str | None, out: Path, url: str | None, headless: bool) -> in
             session.wait_until_closed()
     except KeyboardInterrupt:
         print("\nSaving.", flush=True)
-    except NotImplementedError as exc:
-        print(exc, file=sys.stderr)
-        return 1
     except Exception as exc:
-        if exc.__class__.__name__ == "GeoTimezoneError":
-            print(exc, file=sys.stderr)
-            return 1
-        raise
+        print(f"oby: {exc}", file=sys.stderr)
+        return 1
     print(f"Saved {label}/session.har and {label}/scripts.json", flush=True)
     return 0
 

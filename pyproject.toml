@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oby"
-version = "0.1.0"
-description = "Record a stealth Firefox session as a HAR, including the JavaScript that ran."
+version = "0.2.0"
+description = "Record a stealth browser session as a HAR, including the JavaScript that ran."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "mavroth" }]
 dependencies = [
-  "invisible-playwright>=0.51",
-  "invisible-playwright-mcp>=0.73",
+  # 0.7 refuses to start its free browser without a license key.
+  "cloakbrowser>=0.6,<0.7",
+  "playwright>=1.64",
+  "mcp>=1.20",
   "mitmcloak>=0.1",
   "cursory>=2.1",
-  "certifi",
 ]
 
 [project.optional-dependencies]

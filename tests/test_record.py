@@ -81,49 +81,6 @@ def test_mitmdump_comes_from_this_environment():
     assert Path(argv[0]).resolve().is_relative_to(Path(sys.prefix).resolve())
 
 
-def test_browser_proxy_is_the_open_recorder():
-    from oby.trust import browser_proxy
-
-    assert browser_proxy("http://127.0.0.1:9") == {"server": "http://127.0.0.1:9"}
-    try:
-        browser_proxy("http://oby:secret@127.0.0.1:9")
-    except ValueError as exc:
-        assert "userinfo" in str(exc)
-    else:
-        raise AssertionError("userinfo was accepted")
-
-
-def test_trust_bundle_keeps_public_roots_and_the_recorder_ca(tmp_path: Path):
-    from oby.trust import write_trust_bundle
-
-    ca = tmp_path / "ca.pem"
-    ca.write_text("-----BEGIN CERTIFICATE-----\nOBYRECORDER\n-----END CERTIFICATE-----\n", encoding="utf-8")
-    bundle = write_trust_bundle(ca, tmp_path / "trust.pem")
-    text = bundle.read_text(encoding="utf-8")
-    assert "OBYRECORDER" in text
-    assert text.count("BEGIN CERTIFICATE") > 1
-
-
-def test_recorder_certificate_is_accepted_on_the_context():
-    from invisible_playwright._session import CommonLaunch
-
-    from oby.trust import accept_recorder_certificate
-
-    original = CommonLaunch._default_context_kwargs
-
-    def fake(self):
-        return {"locale": "en-US"}
-
-    CommonLaunch._default_context_kwargs = fake
-    try:
-        accept_recorder_certificate()
-        kwargs = CommonLaunch._default_context_kwargs(None)
-        assert kwargs["ignore_https_errors"] is True
-        assert kwargs["locale"] == "en-US"
-    finally:
-        CommonLaunch._default_context_kwargs = original
-
-
 def test_recorder_proxy_has_no_userinfo(tmp_path: Path):
     mitm = Mitm(tmp_path)
     mitm.port = 9

@@ -1,22 +1,24 @@
 ---
 name: oby
-description: Records a stealth Firefox session as a HAR, including the JavaScript that ran, through an optional upstream proxy. Use when recording a browser visit, writing session.har or scripts.json, running oby browse or oby mcp, or invoking /oby.
+description: Records a stealth browser session as a HAR, including the JavaScript that ran, through an optional upstream proxy. Use when recording a browser visit, writing session.har or scripts.json, running oby browse or oby mcp, or invoking /oby. The browser is a patched Chromium on this machine. Read hosts and script counts, and leave cookies, headers, and script source in the folder.
 license: MIT
-compatibility: Python 3.11 or newer. On macOS, Docker Desktop must be running so Oby can use the published Linux x86_64 Firefox engine. Install the oby program separately from this skill.
+compatibility: Python 3.11 or newer. The browser runs on the machine itself. Install the oby program separately from this skill.
 metadata:
   author: mavroth
-  version: "0.1.0"
-  short-description: Record a stealth Firefox session as a HAR
+  version: "0.2.0"
+  short-description: Record a stealth browser session as a HAR
 ---
 
 # Oby
 
-Oby records one Firefox session as the browser sent it. This skill is version 0.1.0 of https://github.com/mavroth/oby. The installable version is the git tag.
+Oby records one browser session as the browser sent it. You get a HAR, every script the engine parsed, and an optional upstream proxy. The browser is CloakBrowser, a patched Chromium that runs on this machine. This skill is version 0.2.0 of https://github.com/mavroth/oby. The installable version is the git tag. The repository README is the long description of every file in the folder.
+
+The script list is the one [Ghostwire](https://github.com/sofianeelhor/ghostwire) records on Chrome, kept next to the traffic. The record is the source of each script the engine parsed. Function hooks, resolved runtime values, and heap search stay in Ghostwire.
 
 ## Install this skill
 
 ```bash
-npx skills add mavroth/oby@v0.1.0 --skill oby
+npx skills add mavroth/oby@v0.2.0 --skill oby
 ```
 
 `npx skills add mavroth/oby --skill oby` follows the default branch. A later release is the same command with that release's tag.
@@ -29,7 +31,7 @@ cd oby
 pip install -e .
 ```
 
-The first start downloads the Firefox engine, about 260 MB, and checks its sha256. On a Mac that download happens inside Docker (`linux/amd64`). Leave Docker Desktop running. Do not look for a macOS engine and do not start the container yourself. `oby` does that.
+The first start downloads CloakBrowser's Chromium into `~/.cloakbrowser`. No license key is needed.
 
 ## Which command
 
@@ -56,31 +58,41 @@ oby mcp --out session
 }
 ```
 
-Add `--headless` when no window should appear. On a Mac a visible session opens in Screen Sharing. The share has no password and listens on this machine only.
+`oby` with no subcommand is `oby browse`. Add `--headless` when no window should appear.
 
-An upstream proxy is `OBY_PROXY`, set in the environment that launches `oby`. Do not put a proxy URL that contains a password on the command line, in MCP config, or in chat. The browser talks only to the local recorder. Do not start another proxy, and do not browse to the recorder's port. No tool can change the proxy after launch.
+An upstream proxy is `OBY_PROXY`, set in the environment that launches `oby`. Keep a proxy URL that contains a password out of the command line, MCP config, and chat. The browser talks only to the local recorder. Leave the recorder's port alone. No tool can change the proxy after launch.
 
-Give the first `oby mcp` start several minutes. The engine download finishes before the server answers.
+The server answers in about a second. The first `browser_open` downloads the browser if it is not there yet, so that one call can take minutes.
 
 ## While the agent is connected
 
 The project allows every tool on the `oby` server (`.claude/settings.json`). After the folder is trusted once, do not ask the person before each browser tool.
 
-1. Call `browser_open` before any other browser tool. With no arguments it restores the seed, proxy, and profile for this process.
-2. Go where you were asked. Firefox writes its own startup traffic first. The page follows. On a Mac, allow about a minute after navigation before you decide the page is missing.
+1. Call `browser_open` before any other browser tool. It opens the browser on the recorder, with the profile in the output folder.
+2. Go where you were asked with `browser_navigate`. The browser's own startup requests, if any, are written first. The page follows. `browser_snapshot` returns the page with a ref on each element, and `browser_click` and `browser_type` take that ref. Take a new snapshot after the page changes.
 3. Call `oby_recording` for the folder, `session.har`, `scripts.json`, and the counts. During the visit it counts exchanges so far. A client may prefix the tool name.
 4. Close the MCP client. That write produces `session.har` and `scripts.json`. Until then, exchanges are in `flows.jsonl`.
 
-Each launch of `oby browse` or `oby mcp` clears `flows.jsonl`, the script logs, `scripts.json`, and `session.har` in `--out`, then records this visit. The profile stays.
+Each launch of `oby browse` or `oby mcp` starts `--out` empty and records this visit. The previous visit moves to `history/<when it began>/`. The profile stays.
 
-`oby_recording` returns paths and counts. It does not return cookies, header values, or script source. Leave those in the folder. Do not print them, the proxy password, or the egress address. Treat the output folder like a password.
+## Check the visit
 
-`oby browse` also writes `storage.json` (cookies and localStorage) when the window closes. `oby mcp` does not.
+Decide from hosts and counts. Leave cookies, header values, script source, the proxy password, and the egress address in the folder.
+
+A `flows.jsonl` line has `url` and `status`. The page has loaded when the host you asked for is in that file. `scripts.json` has `counts` by kind (`network`, `inline`, `eval`, `function`, `timer`, `blob`) and a `note` that says whether the list came from the engine or from the recording alone. During the visit, `oby_recording` returns `scripts_so_far` and `script_kinds`. `scripts.json` itself appears when the client closes.
+
+`oby_recording` returns paths and counts. It does not return cookies, header values, or script source. `requests_not_recorded` is how many requests the browser got an answer to that the recorder has no exchange for. It should be 0.
+
+To answer a question about the visit while it runs, read the recording through the server. `oby_exchanges` lists exchanges, filters by `host`, `method`, `status`, or `contains`, and gives the script frame that made each request as `initiator`. `oby_exchange` returns one exchange by `index`, with headers and bodies. `oby_messages` returns the WebSocket messages of a handshake exchange. `oby_scripts` lists scripts and finds `contains` in their source. `oby_script` returns a slice of one script by `sha256`. These four return real cookies and tokens. Read what the task needs, and keep those values out of what you tell the person.
+
+`oby_save` writes `session.har`, `scripts.json`, `scripts/`, and `storage.json` now, and the visit keeps recording.
+
+`storage.json` (cookies and localStorage) is written when the browser closes, under `oby browse` and `oby mcp`.
 
 ## What was recorded
 
-`session.har` is a HAR 1.2 log. Header order is the header arrays. Each entry's `_oby` object holds the HTTP/2 preface and the mitmcloak result.
+`session.har` is a HAR 1.2 log. Header order is the header arrays. Each entry's `_oby` object holds the HTTP/2 preface, the mitmcloak result, and every clock reading. Bodies are whole. WebSocket messages are `_webSocketMessages` on the handshake entry, and `ws.jsonl` has them during the visit. A response reaches the page as it arrives. For an event stream, `_oby.events` has each event with the time it came. `_oby.initiator` is the script frame that made the request. Each navigation is a page.
 
-`scripts.json` is the Firefox counterpart of the script list [Ghostwire](https://github.com/sofianeelhor/ghostwire) records on Chrome: every script the engine parsed, read from the debugger, with nothing injected into the page. It includes fetched files, inline scripts, `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, a blob worker, a dedicated worker loaded from its own URL, and a script inserted into the page. The listener is Firefox's remote debugger on loopback. It does not pause the page. `zoom.stealth.debugger.force_detach` is turned off so those scripts are reported. A page cannot read that preference. Attaching can change how the engine compiles a script. If the listener does not start, a page hook is the fallback and a site can see it. The hook's collector exchange is not a HAR entry.
+`scripts/` holds each script's source as `<sha256>.js`.
 
-The repository README is the long description of every file in the folder.
+`scripts.json` lists every script the engine parsed: fetched files, inline scripts, `eval`, `new Function`, a string passed to `setTimeout` or `setInterval`, a blob worker, a worker loaded from its own URL, and a script inserted into the page. The listener is a DevTools client on loopback. It turns on Debugger and Network only, skips `debugger` statements, and injects nothing into the page. A string timer is listed as `eval`. An item with `from: wire` took its text from the recorded response, and `reported: false` on it means the file was fetched to run and the engine never named it. What `browser_evaluate` runs is left out.

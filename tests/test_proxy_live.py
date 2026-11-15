@@ -12,7 +12,6 @@ import pytest
 
 import sys
 
-from oby.mcp import mcp_command, mcp_environment
 from oby.proxy import Mitm
 
 
@@ -155,39 +154,3 @@ def test_upstream_receives_order_case_and_duplicate_cookies(tmp_path: Path):
     text = raw.decode("latin-1", errors="replace")
     assert "X-Odd-Case: kept\r\nCookie: a=1\r\nCookie: b=2\r\n" in text, text
     assert "proxy-authorization" not in text.lower()
-
-
-def test_mcp_env_points_firefox_at_the_open_recorder(tmp_path: Path):
-    trust = tmp_path / "trust.pem"
-    trust.write_text("ca", encoding="utf-8")
-    env = mcp_environment(
-        server="http://127.0.0.1:9",
-        profile=tmp_path / "profile",
-        trust=trust,
-        headless=False,
-    )
-    assert env["STEALTHFOX_PROXY"] == "http://127.0.0.1:9"
-    assert "@" not in env["STEALTHFOX_PROXY"]
-    assert "STEALTHFOX_NO_PROXY" not in env
-    assert env["STEALTHFOX_PROFILE_DIR"] == str((tmp_path / "profile").resolve())
-    assert env["STEALTHFOX_HEADLESS"] == "0"
-    assert env["REQUESTS_CA_BUNDLE"] == str(trust)
-    assert env["SSL_CERT_FILE"] == str(trust)
-    assert env["INVISIBLE_MCP_SESSION_ID"] == f"oby-{os.getpid()}"
-    assert env["OBY_OUT"] == str(tmp_path.resolve())
-    command = mcp_command()
-    assert command[0] == sys.executable
-    assert command[1:] == ["-m", "oby.mcp_entry"]
-
-
-def test_this_mac_has_no_published_engine():
-    if sys.platform != "darwin":
-        return
-    from invisible_playwright import ensure_binary
-
-    try:
-        ensure_binary()
-    except NotImplementedError as exc:
-        assert "macOS" in str(exc)
-    else:
-        raise AssertionError("ensure_binary downloaded an engine on Darwin")

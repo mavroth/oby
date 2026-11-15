@@ -6,36 +6,101 @@ to mitmcloak, which dials the origin with the browser's own TLS fingerprint.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from oby import collect, record
-from oby.scripts import LIVE_NAME, SAVE_FILTER
+from oby.har import WS_NAME
+from oby.scripts import PARSED_NAME
 
 
-def reset_capture(out: Path) -> None:
-    """Drop the previous visit's logs so this visit starts empty.
+# The addons are named by path. Importing them here would load asyncio and
+# mitmproxy into a process that only starts mitmdump.
+_ADDONS = Path(__file__).resolve().parent
+HISTORY_NAME = "history"
+# One visit's files. The profile, the recorder's certificate, and the TLS
+# presets belong to the browser and stay where they are.
+_VISIT_FILES = (
+    "flows.jsonl",
+    WS_NAME,
+    PARSED_NAME,
+    "initiators.jsonl",
+    "scripts.json",
+    "scripts",
+    "session.har",
+    "storage.json",
+    "meta.json",
+    "flows.mitm",
+)
+
+
+def _has_exchange(path: Path) -> bool:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            return any(line.strip() for line in handle)
+    except OSError:
+        return False
+
+
+def _visit_stamp(out: Path) -> str:
+    """When the previous visit began, as a folder name."""
+    started = None
+    try:
+        started = json.loads((out / "meta.json").read_text(encoding="utf-8")).get("started_at")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not isinstance(started, str) or not started:
+        try:
+            moment = datetime.fromtimestamp((out / "flows.jsonl").stat().st_mtime, timezone.utc)
+        except OSError:
+            moment = datetime.now(timezone.utc)
+        started = moment.isoformat()
+    stamp = re.sub(r"[^0-9A-Za-z]+", "-", started.split(".")[0].replace("+00:00", "")).strip("-")
+    return stamp or "visit"
+
+
+def reset_capture(out: Path) -> Path | None:
+    """Move the previous visit aside so this visit starts empty.
 
     The recorder appends. A reused folder otherwise still holds the last
     browser's startup traffic, and a reader can report that the new page
-    never loaded.
+    never loaded. A previous visit that recorded an exchange is moved to
+    history/<when it began>/ and nothing in it is deleted, so a launch that
+    fails cannot cost a recording. A previous visit with no exchange is
+    removed. Returns the history folder when one was written.
     """
-    from oby.har import HAR_NAME
-    from oby.parsed import PARSED_NAME
-    from oby.scripts import SCRIPTS_NAME
-
     out.mkdir(parents=True, exist_ok=True)
-    for name in ("flows.jsonl", LIVE_NAME, PARSED_NAME, SCRIPTS_NAME, HAR_NAME):
+    present = [name for name in _VISIT_FILES if (out / name).exists()]
+    keep = _has_exchange(out / "flows.jsonl")
+    target = None
+    if keep:
+        base = out / HISTORY_NAME / _visit_stamp(out)
+        target = base
+        number = 1
+        while target.exists():
+            number += 1
+            target = base.with_name(f"{base.name}-{number}")
+        target.mkdir(parents=True)
+    for name in present:
+        path = out / name
         try:
-            (out / name).unlink(missing_ok=True)
+            if target is not None:
+                path.rename(target / name)
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
         except OSError:
             pass
+    return target
 
 
 def redact_proxy(url: str | None) -> str | None:
@@ -86,9 +151,9 @@ def build_mitmdump_command(
         # The collector answers before mitmcloak. record.py stays last among
         # the scripts so its running() hook can place HTTP/2 capture after
         # mitmproxy's own next_layer addon.
-        "-s", str(Path(collect.__file__).resolve()),
+        "-s", str(_ADDONS / "collect.py"),
         "-s", cloak_addon_path(),
-        "-s", str(Path(record.__file__).resolve()),
+        "-s", str(_ADDONS / "record.py"),
         "-w", str(flow_path),
         "--set", f"mitmcloak_export_dir={export_dir}",
         "--set", f"mitmcloak_catalogue_dir={catalogue_dir}",
@@ -97,7 +162,6 @@ def build_mitmdump_command(
     ]
     if upstream:
         command.extend(["--set", f"mitmcloak_proxy={upstream}"])
-    command.append(SAVE_FILTER)
     return command
 
 
@@ -114,7 +178,7 @@ def _port_open(port: int) -> bool:
 
 
 class Mitm:
-    def __init__(self, out: Path, upstream: str | None = None, max_body: int = 1_000_000):
+    def __init__(self, out: Path, upstream: str | None = None, max_body: int | None = None):
         self.out = out
         self.upstream = upstream
         self.max_body = max_body
@@ -123,7 +187,7 @@ class Mitm:
         self.confdir = out / "mitm"
         self.flows = out / "flows.mitm"
         self.record_path = out / "flows.jsonl"
-        self.scripts_path = out / LIVE_NAME
+        self.ws_path = out / WS_NAME
         self.log_path = out / "mitmdump.log"
 
     @property
@@ -137,13 +201,23 @@ class Mitm:
     def ca_cert(self) -> Path:
         return self.confdir / "mitmproxy-ca-cert.pem"
 
+    def prepare(self) -> str:
+        """Clear the folder for this visit and choose the port, without starting.
+
+        The agent server is started with this address while the recorder is
+        still loading, so the two start side by side.
+        """
+        if not self.port:
+            self.out.mkdir(parents=True, exist_ok=True)
+            reset_capture(self.out)
+            self.confdir.mkdir(parents=True, exist_ok=True)
+            (self.out / "presets").mkdir(exist_ok=True)
+            (self.out / "seen").mkdir(exist_ok=True)
+            self.port = free_port()
+        return self.server
+
     def start(self) -> str:
-        self.out.mkdir(parents=True, exist_ok=True)
-        reset_capture(self.out)
-        self.confdir.mkdir(parents=True, exist_ok=True)
-        (self.out / "presets").mkdir(exist_ok=True)
-        (self.out / "seen").mkdir(exist_ok=True)
-        self.port = free_port()
+        self.prepare()
         command = build_mitmdump_command(
             listen_port=self.port,
             confdir=self.confdir,
@@ -155,8 +229,9 @@ class Mitm:
         log = self.log_path.open("w", encoding="utf-8")
         env = os.environ.copy()
         env["OBY_RECORD"] = str(self.record_path)
-        env["OBY_SCRIPTS"] = str(self.scripts_path)
-        env["OBY_MAX_BODY"] = str(self.max_body)
+        env["OBY_WS"] = str(self.ws_path)
+        # Bodies are kept whole unless a limit was asked for.
+        env["OBY_MAX_BODY"] = str(self.max_body) if self.max_body else "0"
         self.process = subprocess.Popen(
             command,
             stdout=log,

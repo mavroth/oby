@@ -1,20 +1,15 @@
-"""One invisible-playwright window, one local mitmproxy, one recording directory."""
+"""One CloakBrowser window, one local mitmproxy, one recording directory."""
 
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from datetime import datetime, timezone
 from pathlib import Path
 
-from oby.mouse import Pointer
 from oby.proxy import Mitm, redact_proxy
-from oby.trust import (
-    accept_recorder_certificate,
-    browser_proxy,
-    restore_trust,
-    use_trust_bundle,
-    write_trust_bundle,
-)
+if TYPE_CHECKING:
+    from oby.mouse import Pointer
 
 
 def _now() -> str:
@@ -29,7 +24,7 @@ class Session:
         out: str | Path = "session",
         url: str | None = None,
         headless: bool = False,
-        max_body: int = 1_000_000,
+        max_body: int | None = None,
         seed: int | None = None,
     ):
         self.upstream = proxy
@@ -43,8 +38,6 @@ class Session:
         self.pointer: Pointer | None = None
         self.started_at: str | None = None
         self._closed = False
-        self._launcher = None
-        self._saved_trust: dict[str, str | None] | None = None
 
     def __enter__(self) -> "Session":
         self.start()
@@ -55,33 +48,42 @@ class Session:
 
     def start(self) -> "Session":
         try:
-            # Resolve the engine before the recorder, so a machine with no
-            # published binary fails before a proxy is left listening.
-            from invisible_playwright import InvisiblePlaywright, ensure_binary
+            import os
 
-            from oby.parsed import prepare_output
+            from cloakbrowser import ensure_binary
 
-            prepare_output(self.out)
+            from oby import chrome
+
+            # Resolve the browser before the recorder, so a machine that
+            # cannot run it fails before a proxy is left listening.
             ensure_binary()
+            os.environ["OBY_OUT"] = str(self.out.resolve())
             self.started_at = _now()
             self.mitm.start()
-            bundle = write_trust_bundle(self.mitm.ca_cert, self.out / "mitm" / "trust.pem")
-            self._saved_trust = use_trust_bundle(bundle)
-            accept_recorder_certificate()
-            profile = self.out / "profile"
+            profile = self.out / "chrome-profile"
             profile.mkdir(parents=True, exist_ok=True)
-            # humanize stays off. This browser curves its own pointer, and
-            # Cursory already does that for click and move. One path, not two.
-            # The proxy dict is the browser's own proxy setting.
-            self._launcher = InvisiblePlaywright(
+            port = chrome.free_port()
+            # humanize stays off. CloakBrowser would curve its own pointer,
+            # and Cursory already does that for click and move. One path, not two.
+            self.context = chrome.launch(
+                profile=profile,
+                server=self.mitm.server,
+                ca_pem=self.mitm.ca_cert,
+                debug_port=port,
                 headless=self.headless,
-                proxy=browser_proxy(self.mitm.server),
-                profile_dir=profile,
-                seed=self.seed,
                 humanize=False,
             )
-            self.context = self._launcher.__enter__()
+            if not chrome.start_watch(port, self.out):
+                import sys
+
+                print(
+                    "oby: could not attach to Chrome's DevTools port. "
+                    "Scripts will be listed from the recording only.",
+                    file=sys.stderr,
+                )
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            from oby.mouse import Pointer
+
             self.pointer = Pointer(self.page, seed=self.seed)
             if self.url:
                 self.goto(self.url)
@@ -91,8 +93,6 @@ class Session:
         return self
 
     def goto(self, url: str):
-        # page.goto waits until the debugger is listening, then sends this
-        # document. Waiting here as well kept the request off the recorder.
         self.url = url
         return self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
@@ -108,11 +108,7 @@ class Session:
     def wait_until_closed(self) -> None:
         import time
 
-        # The container asks us to save by creating this file, instead of
-        # with a signal. A signal in the middle of the driver call makes the
-        # cookie snapshot wait forever.
-        stop_file = Path("/tmp/oby-stop")
-        while not stop_file.exists() and self._browser_open():
+        while self._browser_open():
             time.sleep(0.25)
 
     def _browser_open(self) -> bool:
@@ -137,6 +133,11 @@ class Session:
 
         if self.started_at is not None:
             self._write_meta(None)
+        # Everything recorded so far is on disk. Write the HAR and the
+        # scripts from it now, before asking the browser for anything: the
+        # cookie snapshot below can stall, and the session is then stopped
+        # from outside. Both files are written again at the end.
+        self._save_early()
         previous = (
             (signal.SIGINT, signal.signal(signal.SIGINT, signal.SIG_IGN)),
             (signal.SIGTERM, signal.signal(signal.SIGTERM, signal.SIG_IGN)),
@@ -167,16 +168,14 @@ class Session:
                     self._write_meta(final_url)
                 except Exception:
                     pass
-            restore_trust(self._saved_trust)
-            self._saved_trust = None
             for signum, handler in previous:
                 signal.signal(signum, handler)
-        if self._launcher is not None:
+        if self.context is not None:
             try:
-                self._launcher.__exit__(None, None, None)
+                self.context.close()
             except Exception:
                 pass
-            self._launcher = None
+            self.context = None
 
     def _write_meta(self, final_url: str | None) -> None:
         count = 0
@@ -187,25 +186,35 @@ class Session:
         meta = {
             "started_at": self.started_at,
             "ended_at": _now(),
-            "browser": "invisible-playwright",
+            "browser": "cloakbrowser",
             "final_url": final_url,
             "upstream_proxy": redact_proxy(self.upstream),
             "mitm": self.mitm.server if self.mitm.port else None,
             "flows": count,
+            "coverage": _coverage(self.out),
             "files": {
                 "har": "session.har",
                 "scripts": "scripts.json",
                 "flows": "flows.jsonl",
-                "script_reports": "scripts-live.jsonl",
+                "websocket": "ws.jsonl",
+                "script_files": "scripts",
                 "parsed_scripts": "scripts-parsed.jsonl",
                 "mitmproxy": "flows.mitm",
                 "storage": "storage.json",
-                "profile": "profile",
+                "profile": "chrome-profile",
                 "presets": "presets",
             },
         }
         self.out.mkdir(parents=True, exist_ok=True)
         (self.out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    def _save_early(self) -> None:
+        try:
+            from oby import query
+
+            query.save(self.out)
+        except Exception:
+            pass
 
     def _write_har(self) -> None:
         from oby.har import HAR_NAME, write_har
@@ -220,4 +229,14 @@ class Session:
     def _write_scripts(self) -> None:
         from oby.scripts import write_session_scripts
 
-        write_session_scripts(self.out, self.mitm.record_path, self.mitm.scripts_path)
+        write_session_scripts(self.out, self.mitm.record_path)
+
+
+def _coverage(out: Path) -> dict:
+    """The browser's own request list against the recording. `missing` should be empty."""
+    try:
+        from oby import query
+
+        return query.coverage(out)
+    except Exception:
+        return {}

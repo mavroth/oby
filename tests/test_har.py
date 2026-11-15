@@ -86,14 +86,14 @@ def test_a_new_visit_starts_from_an_empty_capture(tmp_path: Path):
 
     (tmp_path / "flows.jsonl").write_text('{"url":"https://old.example/"}\n', encoding="utf-8")
     (tmp_path / "scripts-parsed.jsonl").write_text("{}\n", encoding="utf-8")
-    (tmp_path / "scripts-live.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "initiators.jsonl").write_text("{}\n", encoding="utf-8")
     (tmp_path / "scripts.json").write_text("{}", encoding="utf-8")
     (tmp_path / "session.har").write_text("{}", encoding="utf-8")
     reset_capture(tmp_path)
     for name in (
         "flows.jsonl",
         "scripts-parsed.jsonl",
-        "scripts-live.jsonl",
+        "initiators.jsonl",
         "scripts.json",
         "session.har",
     ):
@@ -113,26 +113,11 @@ def test_exchange_records_timestamps():
 def test_recording_report_counts_flows_and_hides_values(tmp_path: Path, monkeypatch):
     (tmp_path / "flows.jsonl").write_text('{"url":"https://example.com","cookie":"secret"}\n\n', encoding="utf-8")
     monkeypatch.setenv("OBY_OUT", str(tmp_path))
-    monkeypatch.setenv("OBY_HOST_OUT", "/sessions/demo")
     from oby.mcp import recording_report
 
     report = recording_report()
-    assert report["output_dir"] == "/sessions/demo"
-    assert report["har"] == "/sessions/demo/session.har"
+    assert report["output_dir"] == str(tmp_path)
+    assert report["har"] == f"{tmp_path}/session.har"
     assert report["har_ready"] is False
     assert report["flows_so_far"] == 1
     assert "secret" not in json.dumps(report)
-
-
-def test_mcp_is_told_the_session_ends_as_a_har():
-    from invisible_playwright_mcp.mcp import server as mcp_server
-
-    from oby.mcp import teach
-
-    teach(mcp_server)
-    teach(mcp_server)
-    instructions = mcp_server.mcp._mcp_server.instructions
-    assert instructions.count("session.har") == 1 or "session.har" in instructions
-    assert instructions.count("The file to take away is session.har.") == 1
-    names = [tool.name for tool in mcp_server.mcp._tool_manager.list_tools()]
-    assert names.count("oby_recording") == 1
