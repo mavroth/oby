@@ -5,20 +5,20 @@ license: MIT
 compatibility: Python 3.11 or newer. The browser runs on the machine itself. Install the oby program separately from this skill.
 metadata:
   author: mavroth
-  version: "0.2.0"
+  version: "0.2.1"
   short-description: Record a stealth browser session as a HAR
 ---
 
 # Oby
 
-Oby records one browser session as the browser sent it. You get a HAR, every script the engine parsed, and an optional upstream proxy. The browser is CloakBrowser, a patched Chromium that runs on this machine. This skill is version 0.2.0 of https://github.com/mavroth/oby. The installable version is the git tag. The repository README is the long description of every file in the folder.
+Oby records one browser session as the browser sent it. You get a HAR, every script the engine parsed, and an optional upstream proxy. The browser is CloakBrowser, a patched Chromium that runs on this machine. This skill is version 0.2.1 of https://github.com/mavroth/oby. The installable version is the git tag. The repository README is the long description of every file in the folder.
 
 The script list is the one [Ghostwire](https://github.com/sofianeelhor/ghostwire) records on Chrome, kept next to the traffic. The record is the source of each script the engine parsed. Function hooks, resolved runtime values, and heap search stay in Ghostwire.
 
 ## Install this skill
 
 ```bash
-npx skills add mavroth/oby@v0.2.0 --skill oby
+npx skills add mavroth/oby@v0.2.1 --skill oby
 ```
 
 `npx skills add mavroth/oby --skill oby` follows the default branch. A later release is the same command with that release's tag.
@@ -69,7 +69,7 @@ The server answers in about a second. The first `browser_open` downloads the bro
 The project allows every tool on the `oby` server (`.claude/settings.json`). After the folder is trusted once, do not ask the person before each browser tool.
 
 1. Call `browser_open` before any other browser tool. It opens the browser on the recorder, with the profile in the output folder.
-2. Go where you were asked with `browser_navigate`. The browser's own startup requests, if any, are written first. The page follows. `browser_snapshot` returns the page with a ref on each element, and `browser_click` and `browser_type` take that ref. Take a new snapshot after the page changes.
+2. Go where you were asked with `browser_navigate`. The browser's own startup requests, if any, are written first. The page follows. Every tool that changes the page returns the page afterwards, as a tree with a ref such as `e12` on each element. Use the refs from the latest result with `browser_click`, `browser_type`, `browser_hover`, `browser_select_option`, and `browser_upload_files`. `browser_type` sets any kind of field: text is typed, a date is `YYYY-MM-DD`, a slider is its number, a dropdown takes the option's label, a checkbox takes `true` or `false`. `browser_fill_form` sets several fields in one call. Elements in iframes and shadow DOM have refs too. A dialog is accepted for you and reported in the next result. Call `browser_handle_dialog` first to dismiss it instead. A large page comes back as its controls only, and `browser_snapshot` returns the whole tree.
 3. Call `oby_recording` for the folder, `session.har`, `scripts.json`, and the counts. During the visit it counts exchanges so far. A client may prefix the tool name.
 4. Close the MCP client. That write produces `session.har` and `scripts.json`. Until then, exchanges are in `flows.jsonl`.
 

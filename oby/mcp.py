@@ -28,7 +28,9 @@ ACTION_TIMEOUT = 15_000
 
 INSTRUCTIONS = """Oby is recording this browser. It is CloakBrowser, a patched Chromium, running on this machine. The browser talks only to the local recorder on 127.0.0.1. The recorder writes every exchange, and mitmcloak mirrors the browser's TLS toward the site. An upstream proxy, if one was set when Oby started, is used by that recorder. No tool can change it.
 
-Open the browser with browser_open, then browser_navigate. browser_snapshot returns the page as a tree in which each element has a ref such as e12. Pass that ref to browser_click, browser_type, and browser_select_option. Take a new snapshot after the page changes, because refs belong to the snapshot that gave them.
+Open the browser with browser_open, then browser_navigate. Every tool that changes the page returns the page as it is afterwards: a tree in which each element has a ref such as e12. Pass that ref to browser_click, browser_type, browser_select_option, browser_hover, and browser_upload_files. Use the refs from the latest result. A large page is returned as its controls only, and browser_snapshot gives the whole tree.
+
+browser_type sets any field the right way: it types into text fields and rich-text editors, sets a date, time, colour, or slider to the value given, chooses a dropdown option by its label, and takes true or false for a checkbox. browser_fill_form does several fields in one call. Elements inside iframes and shadow DOM have refs like any other. An alert, confirm, or prompt is answered for you (accepted, unless browser_handle_dialog said otherwise) and reported in the next result.
 
 Header order, the original casing, and repeated Cookie headers are kept. On HTTP/2 the client's preface, its pseudo-header order and settings, is kept with the exchange. Bodies are kept whole. A response is passed to the page as it arrives. WebSocket messages are recorded with their handshake exchange, and a text/event-stream body is also split into its events, each with its arrival time.
 
@@ -55,6 +57,10 @@ class Browser:
         self.ready = threading.Event()
         self.failure: str | None = None
         self._lock = asyncio.Lock()
+        # What happened on the page since the last tool result: dialogs and new tabs.
+        self.events: list[dict] = []
+        self.accept_dialogs = True
+        self.dialog_text: str | None = None
 
     async def wait_ready(self) -> None:
         deadline = time.monotonic() + READY_WAIT
@@ -90,6 +96,8 @@ class Browser:
                 if not attached:
                     print("oby: could not attach to Chrome's DevTools port.", file=sys.stderr)
                 self.context.on("page", self._adopt)
+                for page in self.context.pages:
+                    self._watch(page)
                 self.context.set_default_timeout(ACTION_TIMEOUT)
                 self.context.set_default_navigation_timeout(NAV_TIMEOUT)
                 pages = self.context.pages
@@ -102,6 +110,26 @@ class Browser:
     def _adopt(self, page) -> None:
         # A link that opens a tab moves the agent to it, as it would a person.
         self.page = page
+        self._watch(page)
+        self.events.append({"new_tab": "the page opened a new tab, and it is now the current one"})
+
+    def _watch(self, page) -> None:
+        if getattr(page, "_oby_watched", False):
+            return
+        page._oby_watched = True
+        page.on("dialog", lambda dialog: asyncio.ensure_future(self._dialog(dialog)))
+
+    async def _dialog(self, dialog) -> None:
+        """Answer an alert, confirm, or prompt, so the page is never left blocked."""
+        seen = {"dialog": dialog.type, "message": dialog.message, "answer": "accepted" if self.accept_dialogs else "dismissed"}
+        try:
+            if self.accept_dialogs:
+                await dialog.accept(self.dialog_text or dialog.default_value or "")
+            else:
+                await dialog.dismiss()
+        except Exception:
+            seen["answer"] = "already closed"
+        self.events.append(seen)
 
     async def close(self) -> None:
         from oby import chrome, storage
@@ -121,18 +149,146 @@ class Browser:
             pass
 
 
+SNAPSHOT_INLINE = 20_000
+# Inputs a person sets with a picker. Typing digits into one gives a wrong value.
+_PICKERS = frozenset({"date", "time", "datetime-local", "month", "week", "color"})
+_YES = frozenset({"true", "on", "yes", "1", "checked"})
+_NO = frozenset({"false", "off", "no", "0", "unchecked"})
+_INTERACTIVE = frozenset({
+    "button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox", "option", "slider",
+    "spinbutton", "switch", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "treeitem", "heading", "iframe",
+})
+_DESCRIBE = """e => ({
+  tag: e.tagName.toLowerCase(),
+  type: (e.getAttribute('type') || '').toLowerCase(),
+  disabled: !!e.disabled,
+  checked: !!e.checked,
+})"""
+_SET_VALUE = """(e, value) => {
+  const proto = e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, value);
+  e.dispatchEvent(new Event('input', {bubbles: true}));
+  e.dispatchEvent(new Event('change', {bubbles: true}));
+}"""
+_BRING_NEAR = """e => {
+  const box = e.getBoundingClientRect();
+  const tall = window.innerHeight;
+  if (box.bottom < -tall || box.top > 2 * tall) e.scrollIntoView({block: 'center', inline: 'center'});
+}"""
+_PICK_OPTION = """e => {
+  const select = e.closest('select');
+  if (!select) return false;
+  e.selected = select.multiple ? !e.selected : true;
+  select.dispatchEvent(new Event('input', {bubbles: true}));
+  select.dispatchEvent(new Event('change', {bubbles: true}));
+  return true;
+}"""
+
+
 async def _target(page, ref: str | None, selector: str | None):
     """The element to act on, from a snapshot ref or a CSS selector.
 
-    A ref is turned into the element itself first. CloakBrowser's
-    human-shaped click and typing look an element up by selector, and they
-    do not know the snapshot's refs.
+    Always the element itself. CloakBrowser's human-shaped click and typing
+    look an element up by selector, and they do not know the snapshot's refs.
     """
-    if ref:
-        return await page.locator(f"aria-ref={ref.strip()}").element_handle(timeout=ACTION_TIMEOUT)
-    if selector:
-        return page.locator(selector).first
-    raise ValueError("give a ref from browser_snapshot, or a selector")
+    if not ref and not selector:
+        raise ValueError("give a ref from the latest snapshot, or a selector")
+    locator = page.locator(f"aria-ref={ref.strip()}") if ref else page.locator(selector).first
+    try:
+        handle = await locator.element_handle(timeout=2_000 if ref else ACTION_TIMEOUT)
+    except Exception as exc:
+        if ref:
+            raise ValueError(
+                f"no element has ref {ref} now. Refs belong to the latest snapshot. Call browser_snapshot and use the new ref."
+            ) from exc
+        raise ValueError(f"nothing on the page matches the selector {selector!r}") from exc
+    if handle is None:
+        raise ValueError("that element is not on the page any more. Call browser_snapshot.")
+    return handle
+
+
+async def _point(handle) -> tuple[float, float]:
+    await handle.evaluate("e => e.scrollIntoView({block: 'center', inline: 'center'})")
+    box = await handle.bounding_box()
+    if not box:
+        raise ValueError("that element is not visible, so the pointer cannot reach it")
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+async def _click(page, handle, *, double: bool = False) -> None:
+    """Click an element the way a person would, wherever it lives.
+
+    The human-shaped click cannot follow an element inside an iframe. There
+    the pointer goes to the element's place on the page instead.
+    """
+    info = await handle.evaluate(_DESCRIBE)
+    if info["tag"] == "option" and await handle.evaluate(_PICK_OPTION):
+        # A native dropdown is drawn by the system, outside the page.
+        return
+    # The human-shaped scroll takes many seconds to cross a long page. An
+    # element more than a screen away is brought near first, as a person
+    # does with the scrollbar, and the pointer does the rest.
+    await handle.evaluate(_BRING_NEAR)
+    try:
+        await (handle.dblclick() if double else handle.click())
+    except Exception as exc:
+        if "humanize" not in str(exc):
+            raise
+        x, y = await _point(handle)
+        await (page.mouse.dblclick(x, y) if double else page.mouse.click(x, y))
+
+
+async def _fill(page, handle, text: str, *, clear: bool = True, submit: bool = False) -> None:
+    """Put `text` into a field, in the way that kind of field takes it."""
+    info = await handle.evaluate(_DESCRIBE)
+    kind, tag = info["type"], info["tag"]
+    if info["disabled"]:
+        raise ValueError("that field is disabled")
+    if tag == "select":
+        try:
+            await handle.select_option(label=text, timeout=3_000)
+        except Exception:
+            await handle.select_option(value=text, timeout=3_000)
+    elif tag == "input" and kind in ("checkbox", "radio"):
+        wanted = text.strip().lower()
+        if wanted not in _YES | _NO:
+            raise ValueError("a checkbox takes true or false. browser_click toggles it.")
+        if (wanted in _YES) != info["checked"]:
+            await _click(page, handle)
+    elif tag == "input" and kind == "file":
+        raise ValueError("that is a file input. Use browser_upload_files.")
+    elif tag == "input" and kind in _PICKERS:
+        await handle.fill(text)
+    elif tag == "input" and kind == "range":
+        await handle.evaluate(_SET_VALUE, text)
+    else:
+        await _click(page, handle)
+        # Typed at the keyboard, into whatever the click focused. A page
+        # often swaps the field for another one as it takes focus.
+        if clear:
+            await page.keyboard.press("ControlOrMeta+A")
+            await page.keyboard.press("Backspace")
+        await page.keyboard.type(text)
+    if submit:
+        await page.keyboard.press("Enter")
+
+
+def interactive_lines(tree: str) -> str:
+    """The lines of a snapshot an agent can act on: controls, links, headings, frames."""
+    kept = []
+    for line in tree.splitlines():
+        text = line.strip()
+        if not text.startswith("- ") or "[ref=" not in text:
+            continue
+        role = text[2:].split(" ", 1)[0].rstrip(":")
+        if role in _INTERACTIVE:
+            kept.append(text)
+    return "\n".join(kept)
+
+
+async def _snapshot(page, *, interactive: bool = False) -> str:
+    tree = await page.aria_snapshot(mode="ai")
+    return interactive_lines(tree) if interactive else tree
 
 
 async def _state(page) -> str:
@@ -155,33 +311,71 @@ def build_server(browser: Browser):
             structured_output=False,
         )
 
+    async def after(note: str | None = None) -> str:
+        """What a tool that changed the page returns: where the page is now, and what is on it."""
+        # A click can navigate, open a tab, or raise a dialog. Give that a moment to land.
+        await asyncio.sleep(0.25)
+        page = await browser.open()
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except Exception:
+            pass
+        lines = [f"url: {page.url}"]
+        try:
+            lines.append(f"title: {await page.title()}")
+        except Exception:
+            pass
+        if note:
+            lines.append(note)
+        events, browser.events = browser.events, []
+        for event in events:
+            lines.append(json.dumps(event))
+        try:
+            tree = await _snapshot(page)
+        except Exception as exc:
+            lines.append(f"snapshot failed: {exc}")
+            return "\n".join(lines)
+        if len(tree) > SNAPSHOT_INLINE:
+            short = interactive_lines(tree)
+            lines.append(
+                f"The page is large ({len(tree)} characters), so this is its controls, links, and headings. "
+                "browser_snapshot returns the whole tree."
+            )
+            tree = short[:SNAPSHOT_INLINE]
+        lines.extend(["", tree])
+        return "\n".join(lines)
+
     @tool("Open the browser")
     async def browser_open(url: str | None = None) -> str:
         """Open the recorded browser, and go to `url` if one is given. Call this first."""
         page = await browser.open()
         if url:
             await page.goto(url, wait_until="domcontentloaded")
+            return await after()
         return await _state(page)
 
     @tool("Go to a URL")
     async def browser_navigate(url: str) -> str:
-        """Load `url` in the current tab and wait for the document. Returns the final URL and title."""
+        """Load `url` in the current tab. Returns the page that loaded, with a ref on each element."""
         page = await browser.open()
         await page.goto(url, wait_until="domcontentloaded")
-        return await _state(page)
+        return await after()
 
     @tool("Go back")
     async def browser_back() -> str:
         """Go back one page in the current tab's history."""
         page = await browser.open()
         await page.go_back(wait_until="domcontentloaded")
-        return await _state(page)
+        return await after()
 
     @tool("Page snapshot", read_only=True)
-    async def browser_snapshot() -> str:
-        """The page as an accessibility tree. Each element has a ref, such as e12, for browser_click and browser_type."""
+    async def browser_snapshot(interactive: bool = False) -> str:
+        """The page as an accessibility tree, with a ref such as e12 on each element, including those in iframes.
+
+        `interactive` returns only controls, links, headings, and frames, which is much shorter on a large page.
+        """
         page = await browser.open()
-        tree = await page.aria_snapshot(mode="ai")
+        tree = await _snapshot(page, interactive=interactive)
         return f"url: {page.url}\ntitle: {await page.title()}\n\n{tree}"
 
     @tool("Page text", read_only=True)
@@ -210,55 +404,109 @@ def build_server(browser: Browser):
 
     @tool("Click")
     async def browser_click(ref: str | None = None, selector: str | None = None, double: bool = False) -> str:
-        """Click an element, by its ref from browser_snapshot or by a CSS selector."""
+        """Click an element, by its ref from the latest snapshot or by a CSS selector. Returns the page afterwards.
+
+        Works on buttons, links, checkboxes, radios, and the options of a dropdown, in the page, an iframe, or shadow DOM.
+        """
         page = await browser.open()
-        target = await _target(page, ref, selector)
-        await (target.dblclick() if double else target.click())
-        return await _state(browser.page or page)
+        await _click(page, await _target(page, ref, selector), double=double)
+        return await after()
 
     @tool("Click at a point")
     async def browser_click_at(x: float, y: float) -> str:
         """Click at viewport coordinates, for a canvas or anything a snapshot does not name."""
         page = await browser.open()
         await page.mouse.click(x, y)
-        return await _state(browser.page or page)
+        return await after()
 
-    @tool("Type")
-    async def browser_type(text: str, ref: str | None = None, selector: str | None = None, clear: bool = True, submit: bool = False) -> str:
-        """Type `text` into a field, key by key. `clear` empties it first. `submit` presses Enter after."""
+    @tool("Hover")
+    async def browser_hover(ref: str | None = None, selector: str | None = None) -> str:
+        """Move the pointer over an element, to open a menu or a tooltip. Returns the page afterwards."""
         page = await browser.open()
-        target = await _target(page, ref, selector)
-        await target.click()
-        # Typed at the keyboard, into whatever the click focused. A page
-        # often swaps the field for another one as it takes focus.
-        if clear:
-            await page.keyboard.press("ControlOrMeta+A")
-            await page.keyboard.press("Backspace")
-        await page.keyboard.type(text)
-        if submit:
-            await page.keyboard.press("Enter")
-        return await _state(browser.page or page)
+        handle = await _target(page, ref, selector)
+        try:
+            await handle.hover()
+        except Exception as exc:
+            if "humanize" not in str(exc):
+                raise
+            await page.mouse.move(*await _point(handle))
+        return await after()
+
+    @tool("Type into a field")
+    async def browser_type(text: str, ref: str | None = None, selector: str | None = None, clear: bool = True, submit: bool = False) -> str:
+        """Set a field to `text`, whatever kind of field it is. Returns the page afterwards.
+
+        A text field, textarea, or rich-text editor is typed into key by key. A date is YYYY-MM-DD, a time HH:MM,
+        a colour #rrggbb, a slider its number. A dropdown takes the label of the option. A checkbox takes true or false.
+        `clear` empties a text field first. `submit` presses Enter after.
+        """
+        page = await browser.open()
+        await _fill(page, await _target(page, ref, selector), text, clear=clear, submit=submit)
+        return await after()
+
+    @tool("Fill several fields")
+    async def browser_fill_form(fields: list[dict], submit: bool = False) -> str:
+        """Set several fields in one call. Each item is {"ref": "e12", "value": "..."} or {"selector": "...", "value": "..."}.
+
+        Values follow the same rules as browser_type. `submit` presses Enter in the last field. Returns the page afterwards.
+        """
+        page = await browser.open()
+        done = 0
+        for number, field in enumerate(fields):
+            try:
+                handle = await _target(page, field.get("ref"), field.get("selector"))
+                await _fill(page, handle, str(field.get("value", "")), submit=submit and number == len(fields) - 1)
+            except Exception as exc:
+                where = field.get("ref") or field.get("selector")
+                return await after(f"stopped at field {number + 1} ({where}): {exc}. {done} of {len(fields)} were set.")
+            done += 1
+        return await after(f"{done} fields set")
 
     @tool("Press a key")
     async def browser_press_key(key: str) -> str:
-        """Press a key or chord on the page, such as Enter, Escape, ArrowDown, or Control+A."""
+        """Press a key or chord on the page, such as Enter, Escape, Tab, ArrowDown, or Control+A."""
         page = await browser.open()
         await page.keyboard.press(key)
-        return await _state(browser.page or page)
+        return await after()
 
     @tool("Choose an option")
     async def browser_select_option(values: list[str], ref: str | None = None, selector: str | None = None) -> str:
-        """Choose options in a select element, by value or by label."""
+        """Choose options in a select element, by label or by value. Several values choose several in a multiple select."""
         page = await browser.open()
-        chosen = await (await _target(page, ref, selector)).select_option(values)
-        return json.dumps({"selected": chosen})
+        handle = await _target(page, ref, selector)
+        try:
+            chosen = await handle.select_option(label=values, timeout=3_000)
+        except Exception:
+            chosen = await handle.select_option(value=values, timeout=3_000)
+        return await after(f"selected: {json.dumps(chosen)}")
 
     @tool("Upload files")
     async def browser_upload_files(paths: list[str], ref: str | None = None, selector: str | None = None) -> str:
-        """Set the files of a file input."""
+        """Set the files of a file input. `ref` is the input, shown in a snapshot as a button named after its label."""
         page = await browser.open()
         await (await _target(page, ref, selector)).set_input_files(paths)
-        return json.dumps({"uploaded": len(paths)})
+        return await after(f"{len(paths)} file(s) set")
+
+    @tool("Scroll")
+    async def browser_scroll(ref: str | None = None, selector: str | None = None, dy: float = 0) -> str:
+        """Scroll an element into the middle of the view, or scroll the page by `dy` pixels (negative is up)."""
+        page = await browser.open()
+        if ref or selector:
+            await (await _target(page, ref, selector)).evaluate("e => e.scrollIntoView({block: 'center', inline: 'center'})")
+        else:
+            await page.mouse.wheel(0, dy)
+        return await after()
+
+    @tool("Answer dialogs")
+    async def browser_handle_dialog(accept: bool = True, prompt_text: str | None = None) -> str:
+        """Say how the next alert, confirm, or prompt is answered. Call it before the click that raises the dialog.
+
+        Dialogs are accepted by default. `accept=false` dismisses them. `prompt_text` is typed into a prompt.
+        The setting stays until it is changed.
+        """
+        browser.accept_dialogs = accept
+        browser.dialog_text = prompt_text
+        return json.dumps({"dialogs_will_be": "accepted" if accept else "dismissed", "prompt_text": prompt_text})
 
     @tool("Run JavaScript")
     async def browser_evaluate(expression: str) -> str:
@@ -272,7 +520,7 @@ def build_server(browser: Browser):
 
     @tool("Wait", read_only=True)
     async def browser_wait(seconds: float = 0, text: str | None = None, gone: str | None = None) -> str:
-        """Wait for `text` to appear, for `gone` to disappear, or for `seconds` (at most 60)."""
+        """Wait for `text` to appear, for `gone` to disappear, or for `seconds` (at most 60). Returns the page afterwards."""
         page = await browser.open()
         if text:
             await page.get_by_text(text).first.wait_for(state="visible", timeout=NAV_TIMEOUT)
@@ -280,7 +528,7 @@ def build_server(browser: Browser):
             await page.get_by_text(gone).first.wait_for(state="hidden", timeout=NAV_TIMEOUT)
         if seconds:
             await asyncio.sleep(min(max(seconds, 0), 60))
-        return await _state(page)
+        return await after()
 
     @tool("Tabs")
     async def browser_tabs(action: str = "list", index: int | None = None, url: str | None = None) -> str:
@@ -303,6 +551,7 @@ def build_server(browser: Browser):
                 await browser.open()
         elif action != "list":
             raise ValueError("action is list, new, select, or close")
+        browser.events = [event for event in browser.events if "new_tab" not in event]
         pages = [item for item in browser.context.pages if not item.is_closed()]
         return json.dumps(
             [{"index": number, "url": item.url, "current": item is browser.page} for number, item in enumerate(pages)]

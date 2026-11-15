@@ -23,7 +23,7 @@ oby --url https://example.com
 
 `oby` with no subcommand is `oby browse`. Close the window, or press Ctrl+C. Oby writes `session/session.har` and `session/scripts.json`.
 
-An agent follows [An agent](#an-agent). The installable instructions are `npx skills add mavroth/oby@v0.2.0 --skill oby`.
+An agent follows [An agent](#an-agent). The installable instructions are `npx skills add mavroth/oby@v0.2.1 --skill oby`.
 
 ## Commands
 
@@ -172,23 +172,35 @@ oby mcp --out session
 Install the instructions for this release:
 
 ```bash
-npx skills add mavroth/oby@v0.2.0 --skill oby
+npx skills add mavroth/oby@v0.2.1 --skill oby
 ```
 
 `npx skills add mavroth/oby --skill oby` follows the default branch. The skill is [`skills/oby/SKILL.md`](skills/oby/SKILL.md). It tells an agent how to run `oby browse` and `oby mcp`, and which files to keep.
 
 The browser tools are Playwright's, on the browser CloakBrowser opened, with that library's human-shaped pointer and typing.
 
+Every tool that changes the page returns the page as it is afterwards: its URL and title, any dialog or new tab that came up, and a tree in which each element has a ref such as `e12`. The agent passes that ref to the next tool, so one call does the action and shows the result. An element inside an iframe or shadow DOM has a ref like any other. A page whose tree is longer than 20,000 characters is returned as its controls, links, and headings, and `browser_snapshot` gives the whole tree.
+
 | tool | does |
 | --- | --- |
 | `browser_open`, `browser_close` | open or close the browser |
 | `browser_navigate`, `browser_back` | load a URL, go back |
-| `browser_snapshot` | the page as a tree in which each element has a ref |
-| `browser_click`, `browser_type`, `browser_select_option`, `browser_upload_files` | act on an element by its ref or by a CSS selector |
-| `browser_click_at`, `browser_press_key` | a point on the page, a key |
+| `browser_snapshot` | the page as a tree with a ref on each element. `interactive` keeps only controls, links, and headings |
+| `browser_click`, `browser_hover` | click or point at an element, by ref or CSS selector. A click also picks a dropdown option |
+| `browser_type` | set a field of any kind to a value |
+| `browser_fill_form` | set several fields in one call |
+| `browser_select_option`, `browser_upload_files` | choose dropdown options, set a file input |
+| `browser_click_at`, `browser_press_key`, `browser_scroll` | a point on the page, a key, scrolling |
+| `browser_handle_dialog` | say whether the next alert, confirm, or prompt is accepted or dismissed |
 | `browser_read_text`, `browser_read_html`, `browser_take_screenshot` | read the page |
 | `browser_evaluate` | run JavaScript in the page |
 | `browser_wait`, `browser_tabs` | wait for text or time, list and switch tabs |
+
+`browser_type` sets each kind of field the way it takes a value. A text field, a textarea, or a rich-text editor is clicked and typed into key by key. A date, time, or colour input is set to the value whole, because typing digits into a picker gives a wrong value. A slider is set to its number. A dropdown takes the label of the option, and a checkbox takes `true` or `false`.
+
+A dialog never blocks the page. It is accepted, unless `browser_handle_dialog` said to dismiss it, and the next result says what it asked and how it was answered. A link that opens a new tab moves the agent to that tab.
+
+An element more than a screen away is scrolled near at once, and the pointer then moves to it as a person's would.
 
 The server's instructions tell the agent how the recording works. Exchanges land in `flows.jsonl` during the visit. `session.har` and `scripts.json` are written when the client closes. The tool `oby_recording` returns the folder, both paths, and the counts. It returns none of the cookies, header values, or script source.
 

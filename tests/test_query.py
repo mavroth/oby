@@ -167,3 +167,88 @@ def test_the_agent_is_given_the_query_tools(tmp_path: Path, monkeypatch):
     saved = json.loads(asyncio.run(oby_mcp.save()))
     assert saved["exchanges"] == 3 and saved["scripts"] == 2
     assert oby_mcp.recording_report()["websocket_messages_so_far"] == 2
+
+
+def test_a_large_page_is_returned_as_the_things_an_agent_can_act_on():
+    from oby.mcp import interactive_lines
+
+    tree = "\n".join([
+        "- generic [active] [ref=e1]:",
+        '  - heading "Form lab" [level=1] [ref=e2]',
+        "  - generic [ref=e3]:",
+        "    - text: Name",
+        '    - textbox "Name" [ref=e5]: Ada',
+        "      - /placeholder: Your name",
+        '    - paragraph [ref=e6]: A long paragraph nobody clicks.',
+        '    - link "Docs" [ref=e7] [cursor=pointer]:',
+        "    - iframe [ref=e8]:",
+        '      - button "Pay" [ref=f1e2]',
+    ])
+    assert interactive_lines(tree).splitlines() == [
+        '- heading "Form lab" [level=1] [ref=e2]',
+        '- textbox "Name" [ref=e5]: Ada',
+        '- link "Docs" [ref=e7] [cursor=pointer]:',
+        "- iframe [ref=e8]:",
+        '- button "Pay" [ref=f1e2]',
+    ]
+
+
+def test_each_kind_of_field_is_set_the_way_it_takes_a_value():
+    from oby import mcp as oby_mcp
+
+    class Keys:
+        def __init__(self, log):
+            self.log = log
+
+        async def press(self, key):
+            self.log.append(("press", key))
+
+        async def type(self, text):
+            self.log.append(("type", text))
+
+    class Page:
+        def __init__(self):
+            self.log = []
+            self.keyboard = Keys(self.log)
+
+    class Field:
+        def __init__(self, page, **info):
+            self.page = page
+            self.info = {"tag": "input", "type": "", "disabled": False, "checked": False, **info}
+
+        async def evaluate(self, script, *args):
+            if script == oby_mcp._DESCRIBE:
+                return self.info
+            if script == oby_mcp._SET_VALUE:
+                self.page.log.append(("set", args[0]))
+            return None
+
+        async def click(self):
+            self.page.log.append(("click",))
+
+        async def fill(self, text):
+            self.page.log.append(("fill", text))
+
+        async def select_option(self, **kwargs):
+            self.page.log.append(("select", kwargs.get("label")))
+
+    def run(text, **info):
+        page = Page()
+        asyncio.run(oby_mcp._fill(page, Field(page, **info), text))
+        return page.log
+
+    assert run("ada", type="text") == [("click",), ("press", "ControlOrMeta+A"), ("press", "Backspace"), ("type", "ada")]
+    # Typing digits into a date picker gives a wrong date, so it is set whole.
+    assert run("2001-02-03", type="date") == [("fill", "2001-02-03")]
+    assert run("70", type="range") == [("set", "70")]
+    assert run("France", tag="select") == [("select", "France")]
+    assert run("true", type="checkbox") == [("click",)]
+    assert run("true", type="checkbox", checked=True) == []
+    assert run("false", type="checkbox", checked=True) == [("click",)]
+    for bad in (dict(text="maybe", type="checkbox"), dict(text="x", type="file"), dict(text="x", type="text", disabled=True)):
+        text = bad.pop("text")
+        try:
+            run(text, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} was accepted")
