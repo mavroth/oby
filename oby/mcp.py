@@ -40,6 +40,8 @@ scripts.json is written at the same time. It lists the JavaScript Chrome parsed:
 
 Call oby_recording for the folder, both paths, and the counts so far. It returns none of the cookies, header values, or script source. `requests_not_recorded` should be 0: it counts requests the browser got an answer to that the recorder has no exchange for.
 
+A WebAssembly module is listed with the scripts, with the names it imports and exports. oby_script can show a script reformatted (view pretty) or with the obfuscator's spelling undone (view deobfuscated), and can find lines in it by text or regular expression. If Oby was started with --fingerprints, oby_fingerprint lists the fingerprinting APIs the page called (canvas, WebGL, audio, navigator, screen, fonts, WebRTC, storage, and more), with the script that called each.
+
 You can read the recording while the visit is running. oby_exchanges lists what was sent, filters by host, method, status, or text, and names the script frame that made each request. oby_exchange returns one exchange with its headers and bodies. oby_messages returns the WebSocket messages of a handshake exchange. oby_scripts lists the scripts and finds text in their source. oby_script returns a slice of one script. These return what the site and the browser sent, cookies and tokens included, so read only what the task needs and do not repeat secrets to the person. Treat the folder like a password.
 
 Do not start another proxy, and do not browse to the recorder's port."""
@@ -48,10 +50,11 @@ Do not start another proxy, and do not browse to the recorder's port."""
 class Browser:
     """The one browser of this server, opened on first use."""
 
-    def __init__(self, out: Path, mitm: Mitm, headless: bool):
+    def __init__(self, out: Path, mitm: Mitm, headless: bool, fingerprints: bool = False):
         self.out = out
         self.mitm = mitm
         self.headless = headless
+        self.fingerprints = fingerprints
         self.context = None
         self.page = None
         self.ready = threading.Event()
@@ -92,7 +95,9 @@ class Browser:
                     humanize=True,
                 )
                 storage.remember(self.context)
-                attached = await asyncio.to_thread(chrome.start_watch, port, self.out)
+                attached = await asyncio.to_thread(
+                    lambda: chrome.start_watch(port, self.out, fingerprints=self.fingerprints)
+                )
                 if not attached:
                     print("oby: could not attach to Chrome's DevTools port.", file=sys.stderr)
                 self.context.on("page", self._adopt)
@@ -175,6 +180,8 @@ _BRING_NEAR = """e => {
   const tall = window.innerHeight;
   if (box.bottom < -tall || box.top > 2 * tall) e.scrollIntoView({block: 'center', inline: 'center'});
 }"""
+_CENTER = "e => e.scrollIntoView({block: 'center', inline: 'center'})"
+_OUTER_HTML = "e => e.outerHTML"
 _PICK_OPTION = """e => {
   const select = e.closest('select');
   if (!select) return false;
@@ -183,6 +190,14 @@ _PICK_OPTION = """e => {
   select.dispatchEvent(new Event('change', {bubbles: true}));
   return true;
 }"""
+
+
+def _hide_own_snippets() -> None:
+    """Keep what these tools run in the page out of scripts.json. It is not the site's."""
+    from oby import chrome
+
+    for snippet in (_DESCRIBE, _SET_VALUE, _BRING_NEAR, _PICK_OPTION, _CENTER, _OUTER_HTML):
+        chrome.ignore_source(snippet)
 
 
 async def _target(page, ref: str | None, selector: str | None):
@@ -208,7 +223,7 @@ async def _target(page, ref: str | None, selector: str | None):
 
 
 async def _point(handle) -> tuple[float, float]:
-    await handle.evaluate("e => e.scrollIntoView({block: 'center', inline: 'center'})")
+    await handle.evaluate(_CENTER)
     box = await handle.bounding_box()
     if not box:
         raise ValueError("that element is not visible, so the pointer cannot reach it")
@@ -304,6 +319,7 @@ def build_server(browser: Browser):
     from mcp.types import ToolAnnotations
 
     server = FastMCP("oby", instructions=INSTRUCTIONS)
+    _hide_own_snippets()
 
     def tool(title: str, *, read_only: bool = False):
         return server.tool(
@@ -389,7 +405,7 @@ def build_server(browser: Browser):
     async def browser_read_html(selector: str | None = None, max_chars: int = 100_000) -> str:
         """The HTML of the page as it is now, or of the first element matching `selector`."""
         page = await browser.open()
-        html = await page.locator(selector).first.evaluate("e => e.outerHTML") if selector else await page.content()
+        html = await page.locator(selector).first.evaluate(_OUTER_HTML) if selector else await page.content()
         return html[:max_chars]
 
     @tool("Screenshot", read_only=True)
@@ -492,7 +508,7 @@ def build_server(browser: Browser):
         """Scroll an element into the middle of the view, or scroll the page by `dy` pixels (negative is up)."""
         page = await browser.open()
         if ref or selector:
-            await (await _target(page, ref, selector)).evaluate("e => e.scrollIntoView({block: 'center', inline: 'center'})")
+            await (await _target(page, ref, selector)).evaluate(_CENTER)
         else:
             await page.mouse.wheel(0, dy)
         return await after()
@@ -705,34 +721,75 @@ def messages(index: int, offset: int = 0, limit: int = 100) -> str:
 
 def scripts(
     contains: str | None = None,
+    regex: bool = False,
     kind: str | None = None,
     url: str | None = None,
     offset: int = 0,
     limit: int = 50,
 ) -> str:
-    """List the JavaScript recorded so far, without the source.
+    """List the JavaScript and WebAssembly recorded so far, without the source.
 
     Each row has the sha256, kind (network, inline, eval, function, timer,
-    blob), URL, and length. `contains` keeps the scripts whose source has
-    that text and shows up to three places it occurs, with their offsets.
-    Use the sha256 with oby_script.
+    blob, wasm), URL, and length. `contains` keeps the scripts whose source
+    has that text and shows up to three places it occurs, with their
+    offsets. With `regex` it is a regular expression. A WebAssembly module
+    is searched by the names it imports and exports. Use the sha256 with
+    oby_script.
     """
     from oby import query
 
     return _reply(
-        lambda: query.scripts(_out(), contains=contains, kind=kind, url=url, offset=offset, limit=limit)
+        lambda: query.scripts(_out(), contains=contains, regex=regex, kind=kind, url=url, offset=offset, limit=limit)
     )
 
 
-def script(sha256: str, offset: int = 0, length: int = 20_000) -> str:
-    """Return `length` characters of one script's source, starting at `offset`.
+def script(
+    sha256: str,
+    offset: int = 0,
+    length: int = 20_000,
+    view: str = "source",
+    find: str | None = None,
+    regex: bool = False,
+    context: int = 0,
+) -> str:
+    """Read one script, or find lines in it.
 
-    `sha256` comes from oby_scripts. The first characters of it are enough
-    when they are unique. The reply gives the script's full length.
+    `view` is `source` (as Chrome parsed it), `pretty` (reformatted, one
+    statement to a line), or `deobfuscated` (reformatted, with escaped
+    strings, hex numbers, `!![]`, and bracket property names spelled
+    plainly). Nothing is executed, so a rotated string table or flattened
+    control flow stays as it is. The readable views are also written to
+    scripts/ beside the original.
+
+    Without `find`, returns `length` characters from `offset`. With `find`,
+    returns the matching lines with their line numbers, and `context` lines
+    around each (at most 5). In the pretty and deobfuscated views a line is
+    one statement, so search there. `sha256` comes from oby_scripts, and its
+    first characters are enough when unique. For a WebAssembly module this
+    returns its imports and exports.
     """
     from oby import query
 
-    return _reply(lambda: query.script(_out(), sha256, offset=offset, length=length))
+    return _reply(
+        lambda: query.script(
+            _out(), sha256, offset=offset, length=length, view=view, find=find, regex=regex, context=context
+        )
+    )
+
+
+def fingerprint(api: str | None = None, category: str | None = None, script: str | None = None, limit: int = 50) -> str:
+    """Which fingerprinting APIs the page called, most-called first, and which scripts called them.
+
+    Only recorded when oby was started with --fingerprints. Each API has its
+    category (canvas, webgl, audio, navigator, screen, fonts, locale, media,
+    permissions, webrtc, storage, runtime, sensors), how many times it was
+    called, the scripts that called it, and its first calls with arguments
+    and a short form of the result. `api`, `category`, and `script` filter.
+    Give `api` to see every recorded call of it.
+    """
+    from oby import query
+
+    return _reply(lambda: query.fingerprint(_out(), api=api, category=category, script=script, limit=limit))
 
 
 async def save() -> str:
@@ -766,6 +823,7 @@ _TOOLS = (
     ("oby_messages", messages, "WebSocket messages", True),
     ("oby_scripts", scripts, "Recorded scripts", True),
     ("oby_script", script, "One recorded script", True),
+    ("oby_fingerprint", fingerprint, "Fingerprinting APIs called", True),
     ("oby_save", save, "Write the recording now", False),
 )
 
@@ -791,6 +849,7 @@ def _write_meta(out: Path, mitm: Mitm, proxy: str | None, started: str) -> None:
             "websocket": "ws.jsonl",
             "script_files": "scripts",
             "storage": "storage.json",
+            "fingerprint": "fingerprint.json",
             "initiators": "initiators.jsonl",
             "parsed_scripts": "scripts-parsed.jsonl",
             "mitmproxy": "flows.mitm",
@@ -827,7 +886,7 @@ def _coverage(out: Path) -> dict:
         return {}
 
 
-def run_mcp(*, proxy: str | None, out: Path, headless: bool) -> int:
+def run_mcp(*, proxy: str | None, out: Path, headless: bool, fingerprints: bool = False) -> int:
     from oby.session import _now
 
     # The recording tools read the folder from here.
@@ -835,7 +894,7 @@ def run_mcp(*, proxy: str | None, out: Path, headless: bool) -> int:
     mitm = Mitm(out, upstream=proxy)
     mitm.prepare()
     (out / "artifacts").mkdir(parents=True, exist_ok=True)
-    browser = Browser(out, mitm, headless)
+    browser = Browser(out, mitm, headless, fingerprints)
     started = _now()
 
     def start_recorder() -> None:
@@ -886,6 +945,12 @@ def run_mcp(*, proxy: str | None, out: Path, headless: bool) -> int:
         mitm.stop()
         _write_har(out, mitm)
         _write_scripts(out, mitm)
+        try:
+            from oby import fingerprint as fingerprint_log
+
+            fingerprint_log.write_summary(out)
+        except Exception:
+            pass
         _write_meta(out, mitm, proxy, started)
         print(f"oby: saved {label}/session.har and {label}/scripts.json", file=sys.stderr)
     return code

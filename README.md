@@ -23,7 +23,7 @@ oby --url https://example.com
 
 `oby` with no subcommand is `oby browse`. Close the window, or press Ctrl+C. Oby writes `session/session.har` and `session/scripts.json`.
 
-An agent follows [An agent](#an-agent). The installable instructions are `npx skills add mavroth/oby@v0.2.1 --skill oby`.
+An agent follows [An agent](#an-agent). The installable instructions are `npx skills add mavroth/oby@v0.3.0 --skill oby`.
 
 ## Commands
 
@@ -34,6 +34,8 @@ An agent follows [An agent](#an-agent). The installable instructions are `npx sk
 | Let an agent drive | `oby mcp --out session` |
 | Agent, no window | `oby mcp --headless --out session` |
 | Leave through an upstream proxy | `OBY_PROXY='http://user:pass@host:port' oby browse --url https://example.com` |
+| Also log the fingerprinting APIs a page calls | `oby browse --fingerprints --url https://example.com` |
+| Write a readable copy of each recorded script | `oby deobfuscate --out session` |
 
 `--out` defaults to `session`. `--proxy` is the same setting as `OBY_PROXY`. Prefer the environment variable. The password then stays out of the command line.
 
@@ -53,7 +55,9 @@ Each launch starts `--out` empty and records this visit. The previous visit is m
 | `scripts.json` | every script the engine parsed, written when the session ends |
 | `flows.jsonl` | the same exchanges, written as they finish |
 | `ws.jsonl` | each WebSocket message and close, written as it happens |
-| `scripts/` | each script's source as `<sha256>.js`, written with `scripts.json` |
+| `scripts/` | each script's source as `<sha256>.js`, and each WebAssembly module as `<sha256>.wasm`, written with `scripts.json` |
+| `fingerprint.json` | the fingerprinting APIs each page called, by API and by script. Only with `--fingerprints` |
+| `fingerprint.jsonl` | the same calls, written during the visit |
 | `scripts-parsed.jsonl` | each script as the engine parsed it |
 | `initiators.jsonl` | every request the browser made and what started it, as the browser reported it |
 | `flows.mitm` | the capture in mitmproxy's own format, without the bodies of streamed responses |
@@ -105,7 +109,7 @@ When the session has ended, print the script counts. `source` stays in the file.
 python -c 'import json; print(json.load(open("session/scripts.json"))["counts"])'
 ```
 
-`counts` is how many scripts of each kind were kept: `network`, `inline`, `eval`, `function`, `timer`, `blob`. Each script has `kind`, `url`, `sha256`, `length`, `count`, and `source`. `truncated` is set when the source was cut. `from` is `wire` when the text is the recorded response body and not the engine's copy. That happens when the engine named the script and the page closed before its text was read, and when a file was fetched to run (`Sec-Fetch-Dest: script` or a worker) and the engine never named it. The second kind also says `reported: false`. A preload the page never used is the one case where such a file did not run. `note` says whether the list came from the engine or, when the DevTools watch did not attach, from the recording alone.
+`counts` is how many scripts of each kind were kept: `network`, `inline`, `eval`, `function`, `timer`, `blob`, `wasm`. Each script has `kind`, `url`, `sha256`, `length`, `count`, and `source`. `truncated` is set when the source was cut. `from` is `wire` when the text is the recorded response body and not the engine's copy. That happens when the engine named the script and the page closed before its text was read, and when a file was fetched to run (`Sec-Fetch-Dest: script` or a worker) and the engine never named it. The second kind also says `reported: false`. A preload the page never used is the one case where such a file did not run. `note` says whether the list came from the engine or, when the DevTools watch did not attach, from the recording alone.
 
 Header order, the original casing, and repeated `Cookie` headers are the header arrays in the HAR. Each entry's `_oby` object holds the HTTP/2 preface (`pseudo_order`, `settings`) and the mitmcloak result. HTTP/2 lowercases names on the wire, so odd casing is an HTTP/1.1 property. The same preface is what mitmcloak replays upstream, in `presets/`.
 
@@ -118,12 +122,58 @@ Header order, the original casing, and repeated `Cookie` headers are the header 
 - `eval`, `new Function`, and a string passed to `setTimeout` or `setInterval`
 - a blob worker
 - a worker loaded from its own URL
+- a WebAssembly module
 
-The listener is a DevTools client on a loopback port chosen at launch. It attaches to every page, frame, and worker, and turns on two domains: Debugger, which names each script V8 parses and hands over its source, and Network, which lists each request and the frame that made it. Runtime stays off, because a page can detect it. `debugger` statements are skipped, so a page that uses them against DevTools is not paused. Nothing is injected into the page. V8 does not say whether a script with no URL came from `eval`, `new Function`, or a string timer. Oby tells `new Function` by its source and lists a string timer as `eval`.
+The listener is a DevTools client on a loopback port chosen at launch. It attaches to every page, frame, and worker, and turns on two domains: Debugger, which names each script V8 parses and hands over its source, and Network, which lists each request and the frame that made it. `debugger` statements are skipped, so a page that uses them against DevTools is not paused. Nothing is injected into the page, unless you ask for the fingerprint log below.
+
+A WebAssembly module has no source. It is listed with its `length` in bytes, the names it `imports` from the page and `exports` to it, and how many `functions` it defines, and its bytes are `scripts/<sha256>.wasm`. V8 does not say whether a script with no URL came from `eval`, `new Function`, or a string timer. Oby tells `new Function` by its source and lists a string timer as `eval`.
 
 The text of an `eval` or a `new Function` exists only in the engine. Oby asks for those ahead of fetched files, which can be read back from the recording. One that is parsed in the last moment before a page leaves can still be missed.
 
 What Playwright itself evaluates in the page, and what an agent runs with `browser_evaluate`, is left out of the list.
+
+## Reading a script
+
+A recorded script is often minified or obfuscated. `oby deobfuscate --out session` writes a readable copy of each one as `scripts/<sha256>.deob.js`, beside the original, which is never changed. The agent tool `oby_script` returns the same views on request: `source`, `pretty`, and `deobfuscated`.
+
+`pretty` is the same code reformatted, one statement to a line. `deobfuscated` also undoes the spelling an obfuscator uses, and each rewrite keeps what the code does:
+
+| written as | becomes |
+| --- | --- |
+| `'\x68\x69'`, `'\u0068i'` | `'hi'` |
+| `0x1f` | `31` |
+| `!![]`, `![]`, `!0`, `!1`, `void 0` | `true`, `false`, `true`, `false`, `undefined` |
+| `obj['name']` | `obj.name` |
+| `'ab' + 'cd'` | `'abcd'` |
+| `names[3]`, where `names` is a list of strings only ever read by a fixed index | the string |
+
+Nothing is executed. So the two things that need execution are left as they are: a string table the script rotates and reads through a decoder function, which is what obfuscator.io produces, and flattened control flow. If the [`webcrack`](https://github.com/j4k0xb/webcrack) program is on your `PATH`, Oby uses it for the `deobfuscated` view instead, since it handles those. Oby does not download it.
+
+Search works on any view. `oby_scripts` finds text, or a regular expression, across every script, and searches a WebAssembly module by its import and export names. `oby_script` with `find` returns the matching lines of one script with their line numbers. Search the `pretty` or `deobfuscated` view, where a line is one statement.
+
+## Fingerprinting APIs
+
+`--fingerprints`, or `OBY_FINGERPRINTS=1`, also records which fingerprinting APIs each page calls, and from which script. It is off by default, because it is the one thing Oby puts in the page: a script that runs before the page's own and wraps those APIs. A wrapper answers `toString()` as the native function does, leaves no global behind, and sends nothing. A script that looks hard enough can still find it, so a site may behave differently with this on. Record without it when the recording itself must be clean.
+
+| category | what is watched |
+| --- | --- |
+| `canvas` | `toDataURL`, `toBlob`, `getContext`, `getImageData`, `measureText`, `fillText`, and the same on an offscreen canvas |
+| `webgl` | `getParameter`, `getExtension`, `getSupportedExtensions`, `getShaderPrecisionFormat`, `readPixels`, and WebGPU adapter requests |
+| `audio` | creating an audio context, oscillators, compressors, analysers, `startRendering`, `getChannelData` |
+| `navigator` | user agent, platform, hardware concurrency, device memory, languages, plugins, `webdriver`, touch points, client hints, connection, battery, keyboard layout |
+| `screen` | screen size and colour depth, window size and position, `devicePixelRatio`, `matchMedia` |
+| `fonts` | `document.fonts.check`, and element size reads, which is how installed fonts are measured |
+| `locale` | `Intl` resolved options, timezone offset |
+| `media` | `canPlayType`, `isTypeSupported`, `enumerateDevices`, media capabilities, speech voices |
+| `permissions` | `permissions.query`, `Notification.permission` |
+| `webrtc` | creating a peer connection, data channels, offers |
+| `storage` | `localStorage` and `sessionStorage`, `document.cookie`, IndexedDB, storage estimates |
+| `runtime` | `Function.prototype.toString`, `performance.now` and `performance.memory`, visibility and focus, workers, `WebAssembly.instantiate`, property descriptor reads |
+| `sensors` | motion and orientation events, battery, Bluetooth, USB, HID |
+
+`fingerprint.json` lists each API with how many times it was called, the scripts that called it, and its first 20 calls in each page: the arguments, a short form of what came back, and the file, line, and function that called. A long result, such as a canvas image or an audio buffer, is kept as its length and an FNV-1a hash, so two visits can be compared. The APIs a page calls thousands of times (timers, layout reads, storage, `toString`) are counted without their callers.
+
+This browser gives a page no channel to report on: no DevTools bindings and no console events an outside client can hear. So the page keeps the log and Oby reads it, through DevTools, about once a second, and once more when a navigation begins, so a page that fingerprints and redirects does not take its log with it. Calls made inside a worker are not seen, and neither are the calls of a document that began before Oby attached to a new tab.
 
 ## Proxy
 
@@ -172,7 +222,7 @@ oby mcp --out session
 Install the instructions for this release:
 
 ```bash
-npx skills add mavroth/oby@v0.2.1 --skill oby
+npx skills add mavroth/oby@v0.3.0 --skill oby
 ```
 
 `npx skills add mavroth/oby --skill oby` follows the default branch. The skill is [`skills/oby/SKILL.md`](skills/oby/SKILL.md). It tells an agent how to run `oby browse` and `oby mcp`, and which files to keep.
@@ -211,8 +261,9 @@ The agent can read the recording while the visit runs:
 | `oby_exchanges` | the exchanges so far, filtered by host, method, status, or text, without bodies, each with the script frame that made it |
 | `oby_exchange` | one exchange: headers in wire order, both bodies, timing, the HTTP/2 preface |
 | `oby_messages` | the WebSocket messages of one handshake exchange |
-| `oby_scripts` | the scripts so far, and where a piece of text occurs in their source |
-| `oby_script` | a slice of one script's source |
+| `oby_scripts` | the scripts and WebAssembly modules so far, and where a piece of text or a regular expression occurs in them |
+| `oby_script` | one script: a slice of it, or the lines that match, as recorded, reformatted, or deobfuscated |
+| `oby_fingerprint` | the fingerprinting APIs the page called and the scripts that called them, with `--fingerprints` |
 | `oby_save` | writes `session.har`, `scripts.json`, `scripts/`, and `storage.json` now, and returns counts |
 
 `oby_exchange`, `oby_messages`, `oby_scripts`, and `oby_script` return what the site and the browser sent, cookies and tokens included. That content then sits in the agent's conversation.

@@ -27,6 +27,7 @@ SCRIPTS_DIR = "scripts"
 MAX_SOURCE: int | None = None
 MAX_SCRIPTS: int | None = None
 DYNAMIC_KINDS = ("eval", "function", "timer", "blob")
+WASM_KIND = "wasm"
 
 WIRE_NOTE = (
     "JavaScript in this session's recording. "
@@ -162,7 +163,30 @@ def from_exchange(row: dict) -> list[dict]:
     return items
 
 
+def wasm_item(url: str, data: bytes) -> dict:
+    """A WebAssembly module: its bytes, and the names it imports and exports."""
+    from oby import wasm
+
+    item = {
+        "kind": WASM_KIND,
+        "url": url,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "length": len(data),
+        "count": 1,
+        "bytecode": base64.b64encode(data).decode("ascii"),
+    }
+    item.update(wasm.describe(data))
+    return item
+
+
 def from_parsed(row: dict) -> dict | None:
+    if row.get("kind") == WASM_KIND:
+        try:
+            data = base64.b64decode(row.get("bytecode") or "", validate=True)
+        except (ValueError, TypeError):
+            return None
+        url = row.get("url") if isinstance(row.get("url"), str) else ""
+        return wasm_item(url[:2048], data) if data else None
     source = row.get("source")
     if not isinstance(source, str) or source == "":
         return None
@@ -347,12 +371,22 @@ def write_script_files(items: list[dict], folder: Path) -> int:
     """Write each distinct source to folder/<sha256>.js, and name it on the item.
 
     scripts.json keeps the source as well. The files are for grep, a
-    formatter, or a diff, which read a file and not a JSON string.
+    formatter, or a diff, which read a file and not a JSON string. A
+    WebAssembly module is written as <sha256>.wasm, and its bytes are then
+    left out of scripts.json.
     """
     folder.mkdir(parents=True, exist_ok=True)
     written = 0
     for item in items:
         digest = item.get("sha256")
+        if item.get("kind") == WASM_KIND and isinstance(digest, str) and isinstance(item.get("bytecode"), str):
+            path = folder / f"{digest}.wasm"
+            item["file"] = f"{folder.name}/{path.name}"
+            if not path.exists():
+                path.write_bytes(base64.b64decode(item["bytecode"]))
+                written += 1
+            del item["bytecode"]
+            continue
         source = item.get("source")
         if not isinstance(digest, str) or not isinstance(source, str):
             continue

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oby"
-version = "0.2.1"
+version = "0.3.0"
 description = "Record a stealth browser session as a HAR, including the JavaScript that ran."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,7 @@ dependencies = [
   "playwright>=1.64",
   "mcp>=1.20",
   "mitmcloak>=0.1",
+  "jsbeautifier>=1.15",
   "cursory>=2.1",
 ]
 

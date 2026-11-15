@@ -26,7 +26,9 @@ class Session:
         headless: bool = False,
         max_body: int | None = None,
         seed: int | None = None,
+        fingerprints: bool = False,
     ):
+        self.fingerprints = fingerprints
         self.upstream = proxy
         self.out = Path(out)
         self.url = url
@@ -73,7 +75,7 @@ class Session:
                 headless=self.headless,
                 humanize=False,
             )
-            if not chrome.start_watch(port, self.out):
+            if not chrome.start_watch(port, self.out, fingerprints=self.fingerprints):
                 import sys
 
                 print(
@@ -201,6 +203,7 @@ class Session:
                 "parsed_scripts": "scripts-parsed.jsonl",
                 "mitmproxy": "flows.mitm",
                 "storage": "storage.json",
+                "fingerprint": "fingerprint.json",
                 "profile": "chrome-profile",
                 "presets": "presets",
             },
@@ -230,6 +233,12 @@ class Session:
         from oby.scripts import write_session_scripts
 
         write_session_scripts(self.out, self.mitm.record_path)
+        try:
+            from oby import fingerprint
+
+            fingerprint.write_summary(self.out)
+        except Exception:
+            pass
 
 
 def _coverage(out: Path) -> dict:

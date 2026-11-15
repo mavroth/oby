@@ -5,20 +5,20 @@ license: MIT
 compatibility: Python 3.11 or newer. The browser runs on the machine itself. Install the oby program separately from this skill.
 metadata:
   author: mavroth
-  version: "0.2.1"
+  version: "0.3.0"
   short-description: Record a stealth browser session as a HAR
 ---
 
 # Oby
 
-Oby records one browser session as the browser sent it. You get a HAR, every script the engine parsed, and an optional upstream proxy. The browser is CloakBrowser, a patched Chromium that runs on this machine. This skill is version 0.2.1 of https://github.com/mavroth/oby. The installable version is the git tag. The repository README is the long description of every file in the folder.
+Oby records one browser session as the browser sent it. You get a HAR, every script the engine parsed, and an optional upstream proxy. The browser is CloakBrowser, a patched Chromium that runs on this machine. This skill is version 0.3.0 of https://github.com/mavroth/oby. The installable version is the git tag. The repository README is the long description of every file in the folder.
 
 The script list is the one [Ghostwire](https://github.com/sofianeelhor/ghostwire) records on Chrome, kept next to the traffic. The record is the source of each script the engine parsed. Function hooks, resolved runtime values, and heap search stay in Ghostwire.
 
 ## Install this skill
 
 ```bash
-npx skills add mavroth/oby@v0.2.1 --skill oby
+npx skills add mavroth/oby@v0.3.0 --skill oby
 ```
 
 `npx skills add mavroth/oby --skill oby` follows the default branch. A later release is the same command with that release's tag.
@@ -84,6 +84,10 @@ A `flows.jsonl` line has `url` and `status`. The page has loaded when the host y
 `oby_recording` returns paths and counts. It does not return cookies, header values, or script source. `requests_not_recorded` is how many requests the browser got an answer to that the recorder has no exchange for. It should be 0.
 
 To answer a question about the visit while it runs, read the recording through the server. `oby_exchanges` lists exchanges, filters by `host`, `method`, `status`, or `contains`, and gives the script frame that made each request as `initiator`. `oby_exchange` returns one exchange by `index`, with headers and bodies. `oby_messages` returns the WebSocket messages of a handshake exchange. `oby_scripts` lists scripts and finds `contains` in their source. `oby_script` returns a slice of one script by `sha256`. These four return real cookies and tokens. Read what the task needs, and keep those values out of what you tell the person.
+
+`oby_script` also takes `view`: `pretty` reformats the script, and `deobfuscated` also spells out escaped strings, hex numbers, `!![]`, and bracket property names. Nothing is executed, so a rotated string table stays as it is. With `find` it returns the matching lines and their numbers. Search the `deobfuscated` view, where a line is one statement. `oby_scripts` takes `regex`, and lists WebAssembly modules (`kind` `wasm`) with what they import and export.
+
+`oby_fingerprint` lists the fingerprinting APIs the page called, such as canvas, WebGL, audio, navigator, screen, fonts, WebRTC, and storage, with the script, line, and function that called each. It only has data when Oby was started with `--fingerprints`, which runs a script in the page that a site can detect. Add `--fingerprints` to the `args` in the MCP config when the task is to study what a page fingerprints.
 
 `oby_save` writes `session.har`, `scripts.json`, `scripts/`, and `storage.json` now, and the visit keeps recording.
 

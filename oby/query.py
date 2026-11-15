@@ -199,25 +199,53 @@ def _script_items(out: Path) -> list[dict]:
     return items
 
 
-def _snippets(source: str, needle: str, cap: int = 3) -> tuple[int, list[dict]]:
-    lowered = source.lower()
-    needle = needle.lower()
-    found: list[dict] = []
-    count = 0
-    at = lowered.find(needle)
-    while at != -1:
-        count += 1
-        if len(found) < cap:
-            start = max(0, at - SNIPPET)
-            found.append({"offset": at, "text": source[start : at + len(needle) + SNIPPET]})
-        at = lowered.find(needle, at + len(needle))
-    return count, found
+def _matcher(needle: str, regex: bool):
+    """A function that finds every place `needle` occurs in a text, as (start, end) pairs."""
+    import re
+
+    if regex:
+        try:
+            pattern = re.compile(needle, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"that regular expression does not compile: {exc}") from exc
+        return lambda text: [match.span() for match in pattern.finditer(text) if match.end() > match.start()]
+    lowered = needle.lower()
+
+    def find(text: str) -> list[tuple[int, int]]:
+        spans = []
+        hay = text.lower()
+        at = hay.find(lowered)
+        while at != -1:
+            spans.append((at, at + len(lowered)))
+            at = hay.find(lowered, at + len(lowered))
+        return spans
+
+    return find
+
+
+def _snippets(source: str, find, cap: int = 3) -> tuple[int, list[dict]]:
+    spans = find(source)
+    found = [
+        {"offset": start, "text": source[max(0, start - SNIPPET) : end + SNIPPET]}
+        for start, end in spans[:cap]
+    ]
+    return len(spans), found
+
+
+def _searchable(item: dict) -> str:
+    """What a search looks in: the source, or for a WebAssembly module the names it imports and exports."""
+    if item.get("kind") == "wasm":
+        names = [f"import {entry['module']}.{entry['name']}" for entry in item.get("imports") or []]
+        names += [f"export {entry['name']}" for entry in item.get("exports") or []]
+        return "\n".join(names)
+    return item.get("source") or ""
 
 
 def scripts(
     out: Path,
     *,
     contains: str | None = None,
+    regex: bool = False,
     kind: str | None = None,
     url: str | None = None,
     offset: int = 0,
@@ -225,9 +253,11 @@ def scripts(
 ) -> dict:
     """The scripts recorded so far, without their source.
 
-    `contains` keeps the scripts whose source has that text, and shows where.
+    `contains` keeps the scripts whose source has that text, and shows
+    where. With `regex` it is a regular expression.
     """
     items = _script_items(out)
+    find = _matcher(contains, regex) if contains else None
     matched = []
     for item in items:
         if kind and item.get("kind") != kind:
@@ -235,12 +265,14 @@ def scripts(
         if url and url.lower() not in str(item.get("url") or "").lower():
             continue
         entry = {key: item[key] for key in ("sha256", "kind", "url", "length", "count") if key in item}
-        if item.get("introduction"):
-            entry["introduction"] = item["introduction"]
-        if item.get("truncated"):
-            entry["truncated"] = True
-        if contains:
-            count, found = _snippets(item.get("source") or "", contains)
+        for key in ("introduction", "truncated", "from", "reported"):
+            if item.get(key) not in (None, "", False) or (key == "reported" and item.get(key) is False):
+                entry[key] = item[key]
+        if item.get("kind") == "wasm":
+            entry["imports"] = len(item.get("imports") or [])
+            entry["exports"] = len(item.get("exports") or [])
+        if find:
+            count, found = _snippets(_searchable(item), find)
             if not count:
                 continue
             entry["matches"] = count
@@ -255,8 +287,28 @@ def scripts(
     }
 
 
-def script(out: Path, sha256: str, *, offset: int = 0, length: int = 20_000) -> dict:
-    """A slice of one script's source. A sha256 prefix is enough when it is unique."""
+def script(
+    out: Path,
+    sha256: str,
+    *,
+    offset: int = 0,
+    length: int = 20_000,
+    view: str = "source",
+    find: str | None = None,
+    regex: bool = False,
+    context: int = 0,
+) -> dict:
+    """A slice of one script, or the lines in it that match `find`.
+
+    `view` is `source` (as the engine parsed it), `pretty` (reformatted),
+    or `deobfuscated` (reformatted, with the obfuscator's spelling undone).
+    The other two views are written to scripts/ beside the original the
+    first time they are asked for. A sha256 prefix is enough when unique.
+    """
+    from oby import deob
+    from oby.scripts import SCRIPTS_DIR
+
+    out = Path(out)
     wanted = (sha256 or "").strip().lower()
     if not wanted:
         return {"error": "give the sha256 from oby_scripts."}
@@ -267,17 +319,75 @@ def script(out: Path, sha256: str, *, offset: int = 0, length: int = 20_000) -> 
     if len(distinct) > 1:
         return {"error": f"{len(distinct)} scripts start with {wanted}. Give more of the sha256."}
     item = found[0]
-    source = item.get("source") or ""
+    result = {"sha256": item["sha256"], "kind": item.get("kind"), "url": item.get("url")}
+    if item.get("kind") == "wasm":
+        result.update({key: item[key] for key in ("length", "functions", "imports", "exports", "incomplete") if key in item})
+        result["note"] = "A WebAssembly module has no source. Its bytes are in scripts/<sha256>.wasm once the recording is saved."
+        return result
+    if view not in deob.VIEWS:
+        return {"error": f"view is one of {', '.join(deob.VIEWS)}."}
+    text, how = deob.view(out / SCRIPTS_DIR, item["sha256"], item.get("source") or "", view)
+    result["view"] = view
+    result.update(how)
+    result["total_chars"] = len(text)
+    if find:
+        match = _matcher(find, regex)
+        lines = text.splitlines()
+        hits = []
+        total = 0
+        context = max(0, min(int(context), 5))
+        for number, line in enumerate(lines):
+            if not match(line):
+                continue
+            total += 1
+            if len(hits) >= 50:
+                continue
+            first, last = max(0, number - context), min(len(lines), number + context + 1)
+            hits.append({"line": number + 1, "text": "\n".join(part[:400] for part in lines[first:last])})
+        result.update({"find": find, "matching_lines": total, "lines": hits})
+        return result
     offset = max(0, int(offset))
-    length = max(1, int(length))
-    return {
-        "sha256": item["sha256"],
-        "kind": item.get("kind"),
-        "url": item.get("url"),
-        "total_chars": len(source),
-        "offset": offset,
-        "source": source[offset : offset + length],
-    }
+    result.update({"offset": offset, "source": text[offset : offset + max(1, int(length))]})
+    return result
+
+
+def fingerprint(
+    out: Path,
+    *,
+    api: str | None = None,
+    category: str | None = None,
+    script: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """Which fingerprinting APIs the page called, most-called first.
+
+    `api`, `category`, and `script` each keep what contains that text.
+    Without `api`, each API shows its first three calls.
+    """
+    from oby import fingerprint as module
+
+    rows = module.read(Path(out) / module.LOG_NAME)
+    if not rows:
+        return {
+            "total": 0,
+            "note": "No fingerprint log. Start oby with --fingerprints to record which fingerprinting APIs a page calls.",
+        }
+    body = module.summary(rows)
+    kept = []
+    for entry in body["apis"]:
+        if api and api.lower() not in entry["api"].lower():
+            continue
+        if category and category.lower() != entry["category"]:
+            continue
+        if script and not any(script.lower() in url.lower() for url in entry["scripts"]):
+            continue
+        shown = dict(entry)
+        if not api:
+            shown["calls"] = entry["calls"][:3]
+        kept.append(shown)
+    result = {"total": body["total"], "categories": body["categories"], "apis": kept[: max(1, int(limit))]}
+    result["scripts"] = [item for item in body["scripts"] if not script or script.lower() in item["url"].lower()][:20]
+    return result
 
 
 def coverage(out: Path) -> dict:
@@ -293,4 +403,10 @@ def save(out: Path) -> dict:
     out = Path(out)
     entries = write_har(out / FLOWS_NAME, out / HAR_NAME)
     count = write_scripts(out / FLOWS_NAME, out / SCRIPTS_NAME, out / PARSED_NAME)
-    return {"exchanges": entries, "scripts": count}
+    result = {"exchanges": entries, "scripts": count}
+    from oby import fingerprint as module
+
+    calls = module.write_summary(out)
+    if calls is not None:
+        result["fingerprint_calls"] = calls
+    return result

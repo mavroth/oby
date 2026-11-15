@@ -15,10 +15,13 @@ initiators.jsonl      every request the browser made, with the script
                       frame that made it, and whether it was answered,
                       served from cache, or dropped.
 
-Nothing is injected into the page. Only the Debugger and Network domains
-are enabled. Runtime is left off, since a page can detect it. `debugger`
-statements are skipped, so a page that uses them against DevTools is not
-paused.
+Nothing is injected into the page, and the watch enables only the Debugger
+and Network domains. `debugger` statements are skipped, so a page that uses
+them against DevTools is not paused. A WebAssembly module is kept as its
+bytes.
+
+Fingerprint logging (fingerprint.py) is the exception, and it is off unless
+asked for: it runs a script in each page before the page's own.
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ from oby import initiators
 from oby.scripts import PARSED_NAME
 
 MAX_INFLIGHT = 16
+POLL_SECONDS = 0.7
+_DRAIN = "function(){ return this.drain(); }"
 DRAIN_SECONDS = 15.0
 _WATCHED = frozenset({"page", "iframe", "worker", "shared_worker", "service_worker"})
 _SKIP_URLS = ("chrome-extension://", "chrome://", "devtools://", "extensions::", "chrome-untrusted://")
@@ -47,7 +52,8 @@ _DRIVER_MARKS = ("__playwright", "__puppeteer", "pptr:")
 
 
 # What Playwright itself evaluates in the page's own world.
-_DRIVER_SOURCES = ("((utilityScript, ...args) =>", "(injected, ")
+# The last one is oby's own fingerprint hook.
+_DRIVER_SOURCES = ("((utilityScript, ...args) =>", "(injected, ", "(node) => {\n          const doc = node;", "(() => {\n  const apply = Reflect.apply, construct")
 _ignored: set[str] = set()
 
 
@@ -57,7 +63,11 @@ def ignore_source(text: str) -> None:
 
 
 def is_driver_source(text: str) -> bool:
-    return text.startswith(_DRIVER_SOURCES) or text.strip() in _ignored or any(mark in text[-200:] for mark in _DRIVER_MARKS)
+    head = text.lstrip()[:400]
+    if head.startswith("(() => {") and "const module = {};" in head and "__commonJS" in head:
+        # Playwright's own page helpers, bundled.
+        return True
+    return text.lstrip().startswith(_DRIVER_SOURCES) or text.strip() in _ignored or any(mark in text[-200:] for mark in _DRIVER_MARKS)
 
 
 def spki_hash(ca_pem: Path) -> str:
@@ -228,6 +238,8 @@ def script_kind(params: dict) -> str | None:
         return None
     if skip_url(url):
         return None
+    if params.get("scriptLanguage") == "WebAssembly":
+        return "wasm"
     if url.lower().startswith("blob:"):
         return "blob"
     if not url or params.get("hasSourceURL") or not url.lower().startswith(("http://", "https://", "file://")):
@@ -352,9 +364,17 @@ def request_rows(session: str, method: str, params: dict, hops: dict) -> list[di
 
 
 class Watch:
-    def __init__(self, port: int, out: Path):
+    def __init__(self, port: int, out: Path, *, fingerprints: bool = False):
         self.port = port
         self.out = Path(out)
+        # Off unless asked for: this is the one thing that puts code in the page.
+        self.fingerprints = fingerprints
+        # session -> the ids of its frames' own JavaScript worlds.
+        self._worlds: dict[str, set[int]] = {}
+        self._polls = 0
+        self._polled = threading.Event()
+        self._polled.set()
+        self._ticker: threading.Timer | None = None
         self.dest = self.out / PARSED_NAME
         self._socket: _Socket | None = None
         self._thread: threading.Thread | None = None
@@ -393,11 +413,23 @@ class Watch:
         self._thread.start()
         self._send("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
         self.attached = True
+        if self.fingerprints:
+            from oby import fingerprint
+
+            # What the watch itself evaluates to read the log is not the page's.
+            ignore_source(fingerprint.ANCHOR)
+            ignore_source(f"({_DRAIN})")
+            self._tick()
         return True
 
     def stop(self, drain: float = DRAIN_SECONDS) -> None:
         """Wait for the script texts still owed, then close."""
+        if self._ticker is not None:
+            self._ticker.cancel()
         if self._socket is not None and self._thread is not None and self._thread.is_alive():
+            if self.fingerprints:
+                self._poll()
+                self._polled.wait(3)
             self._idle.wait(drain)
         sock, self._socket = self._socket, None
         if sock is not None:
@@ -457,19 +489,25 @@ class Watch:
             info = params.get("targetInfo") if isinstance(params.get("targetInfo"), dict) else {}
             child = params.get("sessionId")
             if isinstance(child, str) and info.get("type") in _WATCHED and not skip_url(str(info.get("url") or "")):
-                self._arm(child)
+                self._arm(child, str(info.get("type")))
         elif method == "Target.detachedFromTarget":
             self._sessions.discard(str(params.get("sessionId") or ""))
         elif method == "Debugger.scriptParsed":
             self._note(session, params)
         elif method == "Debugger.paused":
             self._send("Debugger.resume", session=session)
+        elif isinstance(method, str) and method.startswith("Runtime.executionContext"):
+            self._world(session, method, params)
         elif isinstance(method, str) and method.startswith("Network."):
+            if self.fingerprints and method == "Network.requestWillBeSent" and params.get("type") == "Document":
+                # A page that fingerprints and then moves on takes its log
+                # with it. Read it now, while the old document is still here.
+                self._poll(session)
             rows = request_rows(session, method, params, self._hops)
             if rows:
                 self._append(self.out / initiators.INITIATORS_NAME, rows)
 
-    def _arm(self, session: str) -> None:
+    def _arm(self, session: str, kind: str = "page") -> None:
         if session in self._sessions:
             return
         self._sessions.add(session)
@@ -479,6 +517,109 @@ class Watch:
         # Enabling replays every script this target already parsed.
         self._send("Debugger.enable", session=session)
         self._send("Debugger.setSkipAllPauses", {"skip": True}, session)
+        if self.fingerprints and kind in ("page", "iframe"):
+            from oby import fingerprint
+
+            # Runtime names each frame's JavaScript world, which is where
+            # the log is read from. The driver has it enabled already.
+            self._send("Runtime.enable", session=session)
+            self._send("Page.enable", session=session)
+            self._send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": fingerprint.hook_source(), "runImmediately": True},
+                session,
+            )
+
+    # ---- the fingerprint log
+
+    def _world(self, session: str, method: str, params: dict) -> None:
+        worlds = self._worlds.setdefault(session, set())
+        if method == "Runtime.executionContextCreated":
+            context = params.get("context") if isinstance(params.get("context"), dict) else {}
+            aux = context.get("auxData") if isinstance(context.get("auxData"), dict) else {}
+            if aux.get("isDefault") and isinstance(context.get("id"), int):
+                worlds.add(context["id"])
+        elif method == "Runtime.executionContextDestroyed":
+            worlds.discard(params.get("executionContextId"))
+        else:
+            worlds.clear()
+
+    def _poll(self, only: str | None = None) -> None:
+        """Ask each page for the calls it has noted since last time."""
+        from oby import fingerprint
+
+        for session, worlds in list(self._worlds.items()):
+            if only is not None and session != only:
+                continue
+            for world in list(worlds):
+                with self._lock:
+                    self._polls += 1
+                    self._polled.clear()
+                sent = self._send(
+                    "Runtime.evaluate",
+                    {"expression": fingerprint.ANCHOR, "contextId": world, "objectGroup": "oby"},
+                    session,
+                    then=lambda reply, session=session: self._found_anchor(session, reply),
+                )
+                if sent is None:
+                    self._poll_done()
+
+    def _poll_done(self) -> None:
+        with self._lock:
+            self._polls = max(0, self._polls - 1)
+            if not self._polls:
+                self._polled.set()
+
+    def _found_anchor(self, session: str, reply: dict) -> None:
+        result = (reply.get("result") or {}).get("result") or {}
+        if not result.get("objectId"):
+            # A world the hook is not in: one that went away, or a document
+            # that began before the hook was registered.
+            return self._poll_done()
+        sent = self._send(
+            "Runtime.getProperties",
+            {"objectId": result["objectId"], "ownProperties": True},
+            session,
+            then=lambda reply: self._found_handler(session, reply),
+        )
+        if sent is None:
+            self._poll_done()
+
+    def _found_handler(self, session: str, reply: dict) -> None:
+        handler = None
+        for item in (reply.get("result") or {}).get("internalProperties") or []:
+            if item.get("name") == "[[Handler]]":
+                handler = (item.get("value") or {}).get("objectId")
+        if not handler:
+            return self._poll_done()
+        sent = self._send(
+            "Runtime.callFunctionOn",
+            {"objectId": handler, "functionDeclaration": _DRAIN, "returnByValue": True},
+            session,
+            then=lambda reply: self._drained(session, reply),
+        )
+        if sent is None:
+            self._poll_done()
+
+    def _drained(self, session: str, reply: dict) -> None:
+        from oby import fingerprint
+
+        try:
+            text = ((reply.get("result") or {}).get("result") or {}).get("value")
+            rows = fingerprint.rows_from_report(text) if isinstance(text, str) else []
+            if rows:
+                self._append(self.out / fingerprint.LOG_NAME, rows)
+            self._send("Runtime.releaseObjectGroup", {"objectGroup": "oby"}, session)
+        finally:
+            self._poll_done()
+
+    def _tick(self) -> None:
+        if self._socket is None:
+            return
+        self._poll()
+        self._ticker = threading.Timer(POLL_SECONDS, self._tick)
+        self._ticker.daemon = True
+        self._ticker.start()
 
     def _note(self, session: str, params: dict) -> None:
         kind = script_kind(params)
@@ -521,7 +662,13 @@ class Watch:
             self._inflight.pop(reply.get("id"), None)
         result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
         text = result.get("scriptSource")
-        if isinstance(text, str) and text:
+        if form["kind"] == "wasm":
+            # A module has no text. Its bytes come back as base64.
+            if isinstance(result.get("bytecode"), str) and result["bytecode"]:
+                self._append(self.dest, [{"kind": "wasm", "url": form["url"], "bytecode": result["bytecode"], "introduction": ""}])
+            elif "error" in reply:
+                self._owe(form)
+        elif isinstance(text, str) and text:
             if not is_driver_source(text):
                 row = {"kind": kind_from_source(form["kind"], text), "url": form["url"], "source": text, "introduction": ""}
                 self._append(self.dest, [row])
@@ -558,10 +705,10 @@ class Watch:
 _watch: Watch | None = None
 
 
-def start_watch(port: int, out: Path) -> bool:
+def start_watch(port: int, out: Path, *, fingerprints: bool = False) -> bool:
     """Start the one watch of this process. False if the DevTools port never answered."""
     global _watch
-    watch = Watch(port, out)
+    watch = Watch(port, out, fingerprints=fingerprints)
     if not watch.start():
         return False
     _watch = watch

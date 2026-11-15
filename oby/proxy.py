@@ -33,6 +33,8 @@ _VISIT_FILES = (
     WS_NAME,
     PARSED_NAME,
     "initiators.jsonl",
+    "fingerprint.jsonl",
+    "fingerprint.json",
     "scripts.json",
     "scripts",
     "session.har",
